@@ -456,22 +456,75 @@ def _table3_bin_specs(bins: Sequence[float]) -> List[Tuple[float, float, str, bo
     return specs
 
 
-def _load_effect_map_from_buckets(loc_dir: Path, min_effect: float = 0.0) -> Dict[str, float]:
+def _load_effect_map_from_buckets(
+    loc_dir: Path,
+    min_effect: float = 0.0,
+    circuit_ids: Optional[Iterable[int]] = None,
+) -> Dict[str, float]:
+    """Load singleton agonist effects from neuron_buckets.json.
+
+    When ``circuit_ids`` is provided, only entries whose recorded
+    ``last_record.circuit_id`` belongs to that set are retained.  This is
+    important for BF-vs-CHA comparisons: the slow/brute-force anchoring run
+    is often executed for a single circuit, while the fast spectral-anchor
+    run may contain agonists accumulated across several circuits.  Comparing
+    BF against the unfiltered fast run can therefore count a neuron as
+    recovered even if CHA found it in a different circuit.
+    """
     buckets_path = loc_dir / "neuron_buckets.json"
     if not buckets_path.exists():
         return {}
     buckets = _read_json(buckets_path)
     items = (buckets.get("non_catastrophic_agonists") or {}) if isinstance(buckets, dict) else {}
+    circuit_filter: Optional[set[int]] = None
+    if circuit_ids is not None:
+        circuit_filter = set()
+        for cid in circuit_ids:
+            try:
+                circuit_filter.add(int(cid))
+            except Exception:
+                continue
     out: Dict[str, float] = {}
     for key, info in items.items():
         if not isinstance(info, dict):
             continue
         rec = info.get("last_record") or {}
+        if circuit_filter is not None:
+            try:
+                cid = int(rec.get("circuit_id"))
+            except Exception:
+                continue
+            if cid not in circuit_filter:
+                continue
         effect = rec.get("max_effect", info.get("best_abs_gap", float("nan")))
         eff = abs(_safe_float(effect))
         if eff == eff and eff >= float(min_effect):
             out[str(key)] = eff
     return out
+
+
+def _collect_circuit_ids_from_buckets(loc_dir: Path) -> List[int]:
+    """Return circuit IDs represented in a localization bucket file.
+
+    The value is inferred from non-catastrophic singleton agonist records.  If
+    no such records exist, the caller receives an empty list and should avoid
+    broadening the comparison to all circuits from the paired CHA run.
+    """
+    buckets_path = loc_dir / "neuron_buckets.json"
+    if not buckets_path.exists():
+        return []
+    buckets = _read_json(buckets_path)
+    items = (buckets.get("non_catastrophic_agonists") or {}) if isinstance(buckets, dict) else {}
+    ids = set()
+    for info in items.values():
+        if not isinstance(info, dict):
+            continue
+        rec = info.get("last_record") or {}
+        try:
+            ids.add(int(rec.get("circuit_id")))
+        except Exception:
+            continue
+    return sorted(ids)
 
 
 def _count_bf_vs_cha_by_bins(bf: Dict[str, float], cha: Dict[str, float], bins: Sequence[float]) -> Dict[str, Any]:
@@ -516,8 +569,9 @@ def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float]) -> 
             cha_dir = _localization_dir(model_root, MAIN_RUN, baseline_subset=baseline_subset)
             if not ((bf_dir / "neuron_buckets.json").exists() and (cha_dir / "neuron_buckets.json").exists()):
                 continue
+            bf_circuit_ids = _collect_circuit_ids_from_buckets(bf_dir)
             bf = _load_effect_map_from_buckets(bf_dir, min_effect=min_effect)
-            cha = _load_effect_map_from_buckets(cha_dir, min_effect=min_effect)
+            cha = _load_effect_map_from_buckets(cha_dir, min_effect=min_effect, circuit_ids=bf_circuit_ids)
             counts = _count_bf_vs_cha_by_bins(bf, cha, bins=bins)
             records.append({
                 "task": task,
@@ -531,6 +585,7 @@ def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float]) -> 
                 "bin_counts": counts["bin_counts"],
                 "bf_dir": str(bf_dir),
                 "cha_dir": str(cha_dir),
+                "comparison_circuit_ids": bf_circuit_ids,
             })
     return records
 
@@ -599,12 +654,18 @@ def _table3_aggregate_records(records: Sequence[Dict[str, Any]], bins: Sequence[
 def _table3(data_root: Path, out_dir: Path, task: str, model_spec: str, tau: float, bins: Sequence[float], baseline_subset: str) -> pd.DataFrame:
     records = _table3_collect_baseline_records(data_root, bins=bins)
     df = _table3_aggregate_records(records, bins=bins, include_per_model=True)
-    _write_table_artifacts(df, out_dir, "table3_compact_bf_vs_cha", caption="Table 3: Compact BF-vs-CHA comparison for rule split + spectral coverage vs. rule split + brute-force search.")
+    _write_table_artifacts(
+        df,
+        out_dir,
+        "table3_compact_bf_vs_cha",
+        caption="Table 3: Compact BF-vs-CHA comparison for rule split + spectral coverage vs. rule split + brute-force search, restricted to the brute-force circuit(s).",
+    )
     meta = {
         "compared_runs": {
             "cha": MAIN_RUN,
             "bruteforce": BF_RUN,
         },
+        "cha_scope": "filtered to circuit_id values observed in the corresponding brute-force neuron_buckets.json",
         "bins": list(map(float, bins)),
         "n_completed_baseline_records": int(len(records)),
         "records": [
@@ -615,6 +676,7 @@ def _table3(data_root: Path, out_dir: Path, task: str, model_spec: str, tau: flo
                 "baseline": rec["Baseline"],
                 "bf_dir": rec["bf_dir"],
                 "cha_dir": rec["cha_dir"],
+                "comparison_circuit_ids": rec.get("comparison_circuit_ids", []),
                 "overall_bf": rec["overall_bf"],
                 "overall_recovered": rec["overall_recovered"],
             }
