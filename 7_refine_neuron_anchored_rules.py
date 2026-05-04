@@ -2728,6 +2728,7 @@ def main():
 
 	batch_size = args.batch_size
 	neuron_batch_size = max(1, int(getattr(args, "neuron_batch_size", 1) or 1))
+	print('batch_size:', batch_size, 'neuron_batch_size:', neuron_batch_size)
 	neuron_specs_by_layer = defaultdict(list)
 	for spec in neuron_specs:
 		neuron_specs_by_layer[str(spec[0])].append(spec)

@@ -418,11 +418,9 @@ def main():
 			pos_idx = np.where(mask_arr)[0]
 			neg_idx = np.where(~mask_arr)[0]
 
-			try:
-				pos_idx, neg_idx = balance_positives_and_negatives(pos_idx, neg_idx, t=args.min_points_per_ablation)
-			except Exception as e:
-				n_pos = int(pos_idx.size)
-				n_neg = int(neg_idx.size)
+			n_pos = int(pos_idx.size)
+			n_neg = int(neg_idx.size)
+			if n_pos == 0 or n_neg == 0:
 				sampling_plan["rules"].append(
 					{
 						"rule_id": rid,
@@ -430,7 +428,7 @@ def main():
 						"rule_direction": coeff_sign,
 						"rule_target": primary_target,
 						"status": "skipped",
-						"reason": "No positives or no negatives for this rule.",
+						"reason": f"Empty side for rule: n_pos={n_pos}, n_neg={n_neg}",
 						"n_associated_available": n_pos,
 						"n_unrelated_available": n_neg,
 						"n_associated_selected": 0,
@@ -439,8 +437,36 @@ def main():
 						"unrelated_indices": [],
 					}
 				)
-				# raise ValueError(f"Both pos and neg have < t elements: n_pos={n_pos}, n_neg={n_neg}, t={t}")
-				print(f"Both pos and neg have < t elements: n_pos={n_pos}, n_neg={n_neg}, t={args.min_points_per_ablation}")
+				print(f"[Skip] Rule {rid}: n_pos={n_pos}, n_neg={n_neg}")
+				continue
+
+			try:
+				pos_idx, neg_idx = balance_positives_and_negatives(pos_idx, neg_idx, t=args.min_points_per_ablation)
+			except Exception:
+				sampling_plan["rules"].append(
+					{
+						"rule_id": rid,
+						"rule": rule_str,
+						"rule_direction": coeff_sign,
+						"rule_target": primary_target,
+						"status": "skipped",
+						"reason": (
+							f"Too few datapoints after balancing: "
+							f"n_pos={n_pos}, n_neg={n_neg}, min_points={args.min_points_per_ablation}"
+						),
+						"n_associated_available": n_pos,
+						"n_unrelated_available": n_neg,
+						"n_associated_selected": 0,
+						"n_unrelated_selected": 0,
+						"associated_indices": [],
+						"unrelated_indices": [],
+					}
+				)
+				print(
+					f"[Skip] Rule {rid}: n_pos={n_pos}, n_neg={n_neg}, "
+					f"min_points={args.min_points_per_ablation}"
+				)
+				continue
 
 			n_pos = int(pos_idx.size)
 			n_neg = int(neg_idx.size)
@@ -448,9 +474,47 @@ def main():
 
 			# maximum number of 1-to-1 pairs possible for this rule
 			pair_budget = min(n_pos, n_neg)
+			if pair_budget <= 0:
+				sampling_plan["rules"].append(
+					{
+						"rule_id": rid,
+						"rule": rule_str,
+						"rule_direction": coeff_sign,
+						"rule_target": primary_target,
+						"status": "skipped",
+						"reason": f"No 1-to-1 pair budget available after balancing: n_pos={n_pos}, n_neg={n_neg}",
+						"n_associated_available": n_pos,
+						"n_unrelated_available": n_neg,
+						"n_associated_selected": 0,
+						"n_unrelated_selected": 0,
+						"associated_indices": [],
+						"unrelated_indices": [],
+					}
+				)
+				print(f"[Skip] Rule {rid}: no pair budget after balancing (n_pos={n_pos}, n_neg={n_neg})")
+				continue
 			
 			# pick a target size that never exceeds what's pairable
 			target_n = min(args.max_points_per_ablation, pair_budget)
+			if target_n <= 0:
+				sampling_plan["rules"].append(
+					{
+						"rule_id": rid,
+						"rule": rule_str,
+						"rule_direction": coeff_sign,
+						"rule_target": primary_target,
+						"status": "skipped",
+						"reason": f"Target selection size is zero: target_n={target_n}, pair_budget={pair_budget}",
+						"n_associated_available": n_pos,
+						"n_unrelated_available": n_neg,
+						"n_associated_selected": 0,
+						"n_unrelated_selected": 0,
+						"associated_indices": [],
+						"unrelated_indices": [],
+					}
+				)
+				print(f"[Skip] Rule {rid}: target_n={target_n}, pair_budget={pair_budget}")
+				continue
 			# target_n = max(target_n, min(args.min_points_per_ablation, pair_budget))
 
 			# --- Associated cover via greedy spectral cover ---
@@ -477,6 +541,26 @@ def main():
 					# min_points=min(args.min_points_per_ablation, target_n),
 					return_meta=True,
 				)
+
+			if len(assoc_idx) == 0:
+				sampling_plan["rules"].append(
+					{
+						"rule_id": rid,
+						"rule": rule_str,
+						"rule_direction": coeff_sign,
+						"rule_target": primary_target,
+						"status": "skipped",
+						"reason": "Associated selection returned zero datapoints.",
+						"n_associated_available": n_pos,
+						"n_unrelated_available": n_neg,
+						"n_associated_selected": 0,
+						"n_unrelated_selected": 0,
+						"associated_indices": [],
+						"unrelated_indices": [],
+					}
+				)
+				print(f"[Skip] Rule {rid}: associated selection returned zero datapoints")
+				continue
 
 			if args.compute_cover_stats:
 				assoc_stats = cover_and_cluster_stats_fast(
@@ -600,6 +684,24 @@ def main():
 
 			A = emb_all[assoc_idx_arr]
 			B = emb_all[unrel_idx_arr]
+
+			if A.shape[0] == 0 or B.shape[0] == 0:
+				rules_dict.update(
+					{
+						"status": "skipped",
+						"reason": f"No data left after selection to form at least one pair: associated={A.shape[0]}, unrelated={B.shape[0]}",
+						"n_associated_selected": 0,
+						"n_unrelated_selected": 0,
+						"associated_indices": [],
+						"unrelated_indices": [],
+					}
+				)
+				sampling_plan["rules"].append(rules_dict)
+				print(
+					f"[Skip] Rule {rid}: no data left after selection to form at least one pair "
+					f"(associated={A.shape[0]}, unrelated={B.shape[0]})"
+				)
+				continue
 
 			if A.shape[0] != B.shape[0]:
 				rules_dict.update(

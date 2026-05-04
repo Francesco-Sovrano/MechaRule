@@ -234,7 +234,7 @@ def parse_args():
 		"--cluster_base_subset",
 		type=str,
 		choices=["positive", "negative", "all"],
-		default="positive",
+		default="all",
 		help=(
 			"In --cluster_by_spectral mode: which subset to form clusters on, based on the primary "
 			"target label (task.DEFAULT_TARGETS[0]). "

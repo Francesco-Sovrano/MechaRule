@@ -284,7 +284,7 @@ except Exception as e:
 	print(f"[WARN] Could not compute stats from cache: {e}")
 
 try:
-	for t in range(2):
+	for t in range(3):
 		time.sleep(30//(t+1))
 		create_cache(
 			args.prompts_answers_pkl_file,

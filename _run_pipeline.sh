@@ -260,24 +260,6 @@ CIRCUIT_DISCOVERY_METHOD_NORM=$(
 )
 CIRCUIT_DISCOVERY_OUTPUT_DIR="$DATA_DIR/neural_circuit_discovery_results${VARIANT_SUFFIX}/$CIRCUIT_DISCOVERY_METHOD_NORM"
 
-CIRCUIT_LABEL=""
-if [[ "${SPLITS:-}" == "spectral" ]]; then
-	CIRCUIT_LABEL+="spectral_split"
-else
-	CIRCUIT_LABEL+="rule_split"
-	CIRCUIT_LABEL+="-${DISCOVERY:-}_sample"
-fi
-if [[ "$CIRCUIT_SIZE" != "100000" ]]; then
-	CIRCUIT_LABEL+="-M${CIRCUIT_SIZE}"
-fi
-DECODE_FLAG=()
-if [[ "$DECODE_ONLY" == "true" ]]; then
-	DECODE_FLAG=(--decode_only)
-	CIRCUIT_LABEL+="-decode_only"
-fi
-echo $CIRCUIT_LABEL
-DISCOVERY_OUT_DIR="$CIRCUIT_DISCOVERY_OUTPUT_DIR/$CIRCUIT_LABEL"
-
 RULES_DIR="$DATA_DIR/rule_extraction_results"
 POINTS_TO_USE_FOR_MEAN_ABLATION=256
 MAX_POINTS_PER_CIRCUIT=128
@@ -296,12 +278,39 @@ fi
 
 # Script 5 still expects the older mean intervention names during evaluation.
 # Normalize donor-style eval interventions only for circuit discovery.
+# Downstream output folders include the effective eval intervention whenever it differs from `mean`.
 SCRIPT5_EVAL_INTERVENTION="$EVAL_INTERVENTION"
 if [[ "$SCRIPT5_EVAL_INTERVENTION" == "mean-donor" ]]; then
 	SCRIPT5_EVAL_INTERVENTION="mean"
 elif [[ "$SCRIPT5_EVAL_INTERVENTION" == "mean-donor-positional" ]]; then
 	SCRIPT5_EVAL_INTERVENTION="mean-positional"
 fi
+
+OUTPUT_EVAL_INTERVENTION_SUFFIX=""
+if [[ "$EVAL_INTERVENTION" != "mean" && "$EVAL_INTERVENTION" != "mean-positional" ]]; then
+	OUTPUT_EVAL_INTERVENTION_SUFFIX="-eval_${EVAL_INTERVENTION}"
+fi
+
+CIRCUIT_LABEL=""
+if [[ "${SPLITS:-}" == "spectral" ]]; then
+	CIRCUIT_LABEL+="spectral_split"
+else
+	CIRCUIT_LABEL+="rule_split"
+	CIRCUIT_LABEL+="-${DISCOVERY:-}_sample"
+fi
+if [[ "$CIRCUIT_SIZE" != "100000" ]]; then
+	CIRCUIT_LABEL+="-M${CIRCUIT_SIZE}"
+fi
+DECODE_FLAG=()
+if [[ "$DECODE_ONLY" == "true" ]]; then
+	DECODE_FLAG=(--decode_only)
+	CIRCUIT_LABEL+="-decode_only"
+fi
+if [[ -n "$OUTPUT_EVAL_INTERVENTION_SUFFIX" ]]; then
+	CIRCUIT_LABEL+="$OUTPUT_EVAL_INTERVENTION_SUFFIX"
+fi
+echo $CIRCUIT_LABEL
+DISCOVERY_OUT_DIR="$CIRCUIT_DISCOVERY_OUTPUT_DIR/$CIRCUIT_LABEL"
 
 # Shared spectral flags (used in multiple calls)
 SPECTRAL_FLAGS=(
