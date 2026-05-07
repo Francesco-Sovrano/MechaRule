@@ -823,24 +823,95 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 	print(f"[Stats] Wrote {os.path.join(out_dir, 'stats', stats_dirname, f'flip_stats_global.json')}")
 
 	K = int(min(topk, len(stats_df)))
+
+	# For papers, 50 neurons is usually too dense unless the figure is full-width.
+	# Keep topk configurable, but consider calling write_flip_stats(..., topk=25)
+	# for the camera-ready figure.
 	dfp = stats_df.head(K).copy()
 
-	x = np.arange(K)
-	width = 0.4
+	import matplotlib.ticker as mticker
 
-	fig_w = max(10.0, 0.35 * K)
-	plt.figure(figsize=(fig_w, 6))
-	plt.bar(x - width/2, dfp["c2i_pct"].values, width, label="Correct→Incorrect")
-	plt.bar(x + width/2, dfp["i2c_pct"].values, width, label="Incorrect→Correct")
-	plt.xticks(x, dfp["neuron"].values, rotation=90, fontsize=8)
-	plt.ylabel("Flipped datapoints (% of evaluated prompts)")
-	plt.title(f"Top-{K} neurons by flip rate (c2i vs i2c)")
-	plt.legend()
-	plt.tight_layout()
+	y = np.arange(K)
 
-	plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_top{K}.pdf")
-	plt.savefig(plot_path, dpi=200, bbox_inches='tight')
-	plt.close()
+	c2i = dfp["c2i_pct"].to_numpy()
+	i2c = dfp["i2c_pct"].to_numpy()
+
+	# ACM/KDD-ish sizing:
+	#   single column: ~3.35 in wide
+	#   double column: ~7.0 in wide
+	fig_w = 7.0
+	fig_h = min(6.0, max(2.2, 0.16 * K + 1.0))
+
+	with plt.rc_context({
+		"font.size": 7,
+		"axes.labelsize": 7,
+		"axes.titlesize": 7,
+		"xtick.labelsize": 6,
+		"ytick.labelsize": 5.5,
+		"legend.fontsize": 6,
+		"pdf.fonttype": 42,
+		"ps.fonttype": 42,
+	}):
+		fig, ax = plt.subplots(figsize=(fig_w, fig_h), constrained_layout=True)
+
+		# Diverging bars: c2i on the left, i2c on the right.
+		ax.barh(
+			y,
+			-c2i,
+			height=0.72,
+			label="Correct→Incorrect",
+			linewidth=0.25,
+			edgecolor="black",
+		)
+		ax.barh(
+			y,
+			i2c,
+			height=0.72,
+			label="Incorrect→Correct",
+			linewidth=0.25,
+			edgecolor="black",
+		)
+
+		ax.axvline(0, linewidth=0.6, color="black")
+
+		ax.set_yticks(y)
+		ax.set_yticklabels(dfp["neuron"].values)
+		ax.invert_yaxis()
+
+		ax.set_xlabel("Flipped datapoints (% of evaluated prompts)")
+		ax.set_ylabel("Neuron")
+
+		# Caption should carry the full explanation; avoid a bulky title in-paper.
+		ax.set_title(f"Top-{K} neurons by directional flip rate", pad=3)
+
+		# Show absolute values on both sides of the diverging axis.
+		ax.xaxis.set_major_formatter(
+			mticker.FuncFormatter(lambda v, _: f"{abs(v):g}")
+		)
+
+		max_pct = float(np.nanmax([c2i.max(initial=0), i2c.max(initial=0)]))
+		ax.set_xlim(-1.08 * max_pct, 1.08 * max_pct if max_pct > 0 else 1)
+
+		ax.grid(axis="x", linewidth=0.3, alpha=0.4)
+		ax.set_axisbelow(True)
+
+		ax.legend(
+			loc="lower center",
+			bbox_to_anchor=(0.5, 1.01),
+			ncol=2,
+			frameon=False,
+			handlelength=1.4,
+			columnspacing=1.0,
+		)
+
+		# Remove unnecessary visual weight.
+		ax.spines["top"].set_visible(False)
+		ax.spines["right"].set_visible(False)
+
+		plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_top{K}.pdf")
+		fig.savefig(plot_path, bbox_inches="tight", pad_inches=0.01)
+		plt.close(fig)
+
 	print(f"[Stats] Wrote {plot_path}")
 
 	return stats_df
