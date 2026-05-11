@@ -2,6 +2,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import re
+import textwrap
 import json
 import argparse
 import zipfile
@@ -45,6 +46,23 @@ from lib.neuron_intervention import (
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ----------------- Paper-friendly plotting defaults -----------------
+# NeurIPS figures are usually embedded at reduced width; keep type large and PDF text editable.
+plt.rcParams.update({
+	"font.size": 13,
+	"axes.titlesize": 14,
+	"axes.labelsize": 13,
+	"xtick.labelsize": 11,
+	"ytick.labelsize": 11,
+	"legend.fontsize": 11,
+	"figure.titlesize": 15,
+	"pdf.fonttype": 42,
+	"ps.fonttype": 42,
+	"savefig.dpi": 300,
+	"savefig.bbox": "tight",
+	"savefig.pad_inches": 0.04,
+})
 
 # ----------------- Metric naming helpers -----------------
 _RULE_METRIC_SPECS = {
@@ -190,6 +208,15 @@ def parse_args():
 		type=int,
 		default=64,
 		help="Minimum number of sampled prompts when spectral sampling is used.",
+	)
+	ap.add_argument(
+		"--exclude_discovery_rows_from_final_stats",
+		action="store_true",
+		help=(
+			"Before writing final flip statistics, drop rows that were sampled as "
+			"associated/unrelated examples during CHA discovery. This removes direct "
+			"post-selection overlap without requiring a separate test split."
+		),
 	)
 	ap.add_argument(
 		"--sampling_chunk_size",
@@ -630,6 +657,86 @@ def extract_single_neurons(
 	neurons = canonicalize_neurons(neurons)
 	return sorted(neurons, reverse=True, key=lambda x: (_layer_sort_key(x[0]), int(x[1]), x[2]))
 
+
+def _iter_discovery_payloads(circuit_agonists_path: Path):
+	"""Yield per-rule/per-cluster JSON payloads that may contain discovery sampled indices."""
+	if circuit_agonists_path.is_dir():
+		for fp in circuit_agonists_path.rglob("*.json"):
+			if fp.name in {"neuron_buckets.json", "neuron_bucket_stats.json", "rule_knockout.json"}:
+				continue
+			try:
+				payload = json.loads(fp.read_text(encoding="utf-8"))
+			except Exception:
+				continue
+			if isinstance(payload, dict):
+				yield payload
+	elif circuit_agonists_path.is_file() and circuit_agonists_path.suffix.lower() == ".zip":
+		with zipfile.ZipFile(circuit_agonists_path) as zf:
+			for name in zf.namelist():
+				base = Path(name).name
+				if not name.endswith(".json") or base in {"neuron_buckets.json", "neuron_bucket_stats.json", "rule_knockout.json"}:
+					continue
+				try:
+					with zf.open(name) as f:
+						payload = json.load(f)
+				except Exception:
+					continue
+				if isinstance(payload, dict):
+					yield payload
+
+
+def collect_discovery_original_rows(circuit_agonists_path: Path, scores_df: pd.DataFrame) -> set[int]:
+	"""
+	Return original scores.csv row positions used as discovery ablation examples.
+
+	Script 6 samples associated/unrelated indices after dropping is_test rows and
+	resetting the train dataframe index. Therefore, when is_test is present, the
+	stored sampled_*_indices must be mapped back through the train-row positions
+	of the full scores.csv used here. If future artifacts store sampled_*_original_idx
+	directly, those are preferred.
+	"""
+	if "is_test" in scores_df.columns:
+		train_orig_rows = np.where(~scores_df["is_test"].astype(bool).to_numpy())[0].astype(int)
+	else:
+		train_orig_rows = np.arange(len(scores_df), dtype=int)
+
+	out: set[int] = set()
+	for payload in _iter_discovery_payloads(circuit_agonists_path):
+		for key in ("sampled_associated_original_idx", "sampled_unrelated_original_idx"):
+			vals = payload.get(key, [])
+			if isinstance(vals, list):
+				for v in vals:
+					try:
+						out.add(int(v))
+					except Exception:
+						pass
+
+		for key in ("sampled_associated_indices", "sampled_unrelated_indices"):
+			vals = payload.get(key, [])
+			if not isinstance(vals, list):
+				continue
+			for v in vals:
+				try:
+					i = int(v)
+				except Exception:
+					continue
+				if 0 <= i < len(train_orig_rows):
+					out.add(int(train_orig_rows[i]))
+	return out
+
+
+def filter_scores_out_for_final_stats(scores_out: pd.DataFrame, discovery_orig_rows: set[int]) -> pd.DataFrame:
+	"""Drop discovery-overlap rows from the dataframe used only for final stats."""
+	if not discovery_orig_rows:
+		return scores_out
+	if "_orig_row" in scores_out.columns:
+		orig_rows = pd.to_numeric(scores_out["_orig_row"], errors="coerce")
+	else:
+		orig_rows = pd.Series(np.arange(len(scores_out), dtype=int), index=scores_out.index)
+	mask = ~orig_rows.astype("Int64").isin(discovery_orig_rows).to_numpy()
+	return scores_out.loc[mask].copy()
+
+
 # ------------------------- Correctness eval -----------------------------
 def _sha1_of_obj(obj) -> str:
 	"""Stable SHA1 over a JSON-serializable object."""
@@ -836,39 +943,43 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 	c2i = dfp["c2i_pct"].to_numpy()
 	i2c = dfp["i2c_pct"].to_numpy()
 
-	# ACM/KDD-ish sizing:
-	#   single column: ~3.35 in wide
-	#   double column: ~7.0 in wide
-	fig_w = 7.0
-	fig_h = min(6.0, max(2.2, 0.16 * K + 1.0))
+	# Compact, paper-friendly layout while preserving large readable fonts.
+	# The caption can explain details, so we minimize extra vertical overhead.
+	fig_w = 7.2
+	# Keep top-K labels readable. For K=50 this is still full-width-paper friendly,
+	# but it avoids compressed neuron labels after scaling.
+	fig_h = max(3.45, 0.235 * K + 1.25)
+	ytick_fs = 10 if K <= 30 else (9.2 if K <= 40 else 8.6)
 
 	with plt.rc_context({
-		"font.size": 7,
-		"axes.labelsize": 7,
-		"axes.titlesize": 7,
-		"xtick.labelsize": 6,
-		"ytick.labelsize": 5.5,
-		"legend.fontsize": 6,
+		"font.size": 10.5,
+		"axes.labelsize": 10.5,
+		"axes.titlesize": 11,
+		"xtick.labelsize": 10,
+		"ytick.labelsize": ytick_fs,
+		"legend.fontsize": 9.6,
 		"pdf.fonttype": 42,
 		"ps.fonttype": 42,
 	}):
-		fig, ax = plt.subplots(figsize=(fig_w, fig_h), constrained_layout=True)
+		fig, ax = plt.subplots(figsize=(fig_w, fig_h), constrained_layout=False)
+		# Keep only a narrow top band: enough for the legend, without the large blank gap.
+		fig.subplots_adjust(left=0.31, right=0.99, bottom=0.095, top=0.930)
 
 		# Diverging bars: c2i on the left, i2c on the right.
 		ax.barh(
 			y,
 			-c2i,
-			height=0.72,
+			height=0.62,
 			label="Correct→Incorrect",
-			linewidth=0.25,
+			linewidth=0.22,
 			edgecolor="black",
 		)
 		ax.barh(
 			y,
 			i2c,
-			height=0.72,
+			height=0.62,
 			label="Incorrect→Correct",
-			linewidth=0.25,
+			linewidth=0.22,
 			edgecolor="black",
 		)
 
@@ -876,13 +987,13 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 
 		ax.set_yticks(y)
 		ax.set_yticklabels(dfp["neuron"].values)
+		ax.tick_params(axis="y", pad=2)
 		ax.invert_yaxis()
+		# Leave only a minimal data-space gutter above the first row.
+		ax.set_ylim(K - 0.5, -0.62)
 
 		ax.set_xlabel("Flipped datapoints (% of evaluated prompts)")
-		ax.set_ylabel("Neuron")
-
-		# Caption should carry the full explanation; avoid a bulky title in-paper.
-		ax.set_title(f"Top-{K} neurons by directional flip rate", pad=3)
+		# Omit the y-axis label and title to keep the figure tighter in-paper.
 
 		# Show absolute values on both sides of the diverging axis.
 		ax.xaxis.set_major_formatter(
@@ -890,18 +1001,22 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		)
 
 		max_pct = float(np.nanmax([c2i.max(initial=0), i2c.max(initial=0)]))
-		ax.set_xlim(-1.08 * max_pct, 1.08 * max_pct if max_pct > 0 else 1)
+		x_lim = 1.06 * max_pct if max_pct > 0 else 1.0
+		ax.set_xlim(-x_lim, x_lim)
 
 		ax.grid(axis="x", linewidth=0.3, alpha=0.4)
 		ax.set_axisbelow(True)
 
+		# Put the legend just outside the axes, close to the bars, instead of
+		# reserving a tall figure-level legend band.
 		ax.legend(
 			loc="lower center",
-			bbox_to_anchor=(0.5, 1.01),
+			bbox_to_anchor=(0.5, 1.012),
 			ncol=2,
 			frameon=False,
-			handlelength=1.4,
+			handlelength=1.3,
 			columnspacing=1.0,
+			borderaxespad=0.0,
 		)
 
 		# Remove unnecessary visual weight.
@@ -909,7 +1024,7 @@ def write_flip_stats(scores_df: pd.DataFrame, neurons_sorted, out_dir, topk = 50
 		ax.spines["right"].set_visible(False)
 
 		plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"flip_stats_top{K}.pdf")
-		fig.savefig(plot_path, bbox_inches="tight", pad_inches=0.01)
+		fig.savefig(plot_path, bbox_inches="tight", pad_inches=0.03)
 		plt.close(fig)
 
 	print(f"[Stats] Wrote {plot_path}")
@@ -940,6 +1055,51 @@ def _metric_sort_key(metric: str):
 
 def _metric_display(metric: str):
 	return _METRIC_DISPLAY.get(str(metric), str(metric))
+
+
+_PRETTY_COL_LABELS = {
+	"flip_any_rate": "Any flip rate",
+	"c2i_rate": "Correct→incorrect rate",
+	"i2c_rate": "Incorrect→correct rate",
+	"flip_any_count": "Any flip count",
+	"c2i_count": "Correct→incorrect count",
+	"i2c_count": "Incorrect→correct count",
+	"max_effect": "Max effect",
+	"abs_max_effect": "|Max effect|",
+	"accuracy_gap": "Accuracy gap",
+	"abs_accuracy_gap": "|Accuracy gap|",
+	"mean_metric_value": "Mean metric value",
+	"mean_abs_metric_value": "Mean |metric| value",
+	"median_metric_value": "Median metric value",
+	"mean_layer_percentile_rank": "Mean layer percentile rank",
+	"median_layer_percentile_rank": "Median layer percentile rank",
+	"mean_layer_zscore": "Mean layer z-score",
+	"mean_delta_from_layer_mean": "Mean delta from layer mean",
+	"top1_rate": "Top-1 rate",
+	"top5_rate": "Top-5 rate",
+	"top10pct_rate": "Top-10% rate",
+	"delta_mean_metric_value": "Δ mean metric value",
+	"delta_mean_abs_metric_value": "Δ mean |metric| value",
+	"delta_mean_layer_percentile_rank": "Δ mean layer percentile rank",
+	"delta_mean_layer_zscore": "Δ mean layer z-score",
+	"delta_top10pct_rate": "Δ top-10% rate",
+}
+
+def _pretty_col_label(name: str) -> str:
+	"""Human-readable axis/legend label for dataframe column names."""
+	s = str(name)
+	if s in _PRETTY_COL_LABELS:
+		return _PRETTY_COL_LABELS[s]
+	# Preserve useful mathematical prefixes; otherwise remove implementation underscores.
+	s = s.replace("delta_", "Δ ")
+	s = s.replace("c2i", "correct→incorrect").replace("i2c", "incorrect→correct")
+	s = s.replace("_pct", " %").replace("_rate", " rate").replace("_count", " count")
+	s = s.replace("_", " ")
+	return s[:1].upper() + s[1:]
+
+def _wrap_label(label: str, width: int = 18) -> str:
+	"""Wrap long tick labels into compact multi-line labels."""
+	return "\n".join(textwrap.wrap(str(label), width=width, break_long_words=False, break_on_hyphens=False))
 
 
 def _read_csvs_from_dir_or_zip(root_path, suffix):
@@ -1233,10 +1393,12 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 				ax.set_title("Agonist metric rank distributions")
 				ax.grid(True, axis="y", alpha=0.3)
 				fig.tight_layout()
-				png = stats_dir / "agonist_metric_percentile_boxplot.png"
-				fig.savefig(png, dpi=220, bbox_inches="tight")
+				png = stats_dir / "agonist_metric_percentile_boxplot.pdf"
+				fig.savefig(png, dpi=300, bbox_inches="tight")
+				fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
 				pdf.savefig(fig, bbox_inches="tight")
 				paths.append(str(png))
+				paths.append(str(png.with_suffix(".pdf")))
 			plt.close(fig)
 		rate_cols = [c for c in ["top1_rate", "top5_rate", "top10pct_rate"] if c in metric_df.columns]
 		if rate_cols:
@@ -1253,7 +1415,7 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 							sub = sub.loc[sub["split"] == split]
 						vals.append(float(pd.to_numeric(sub[rate_col], errors="coerce").mean()) if len(sub) else np.nan)
 					offset = (idx - (len(rate_cols) * max(1, len(split_order)) - 1) / 2.0) * width
-					label = f"{rate_col.replace('_rate','')}" + (f"/{split}" if split is not None else "")
+					label = _pretty_col_label(rate_col) + (f" / {split}" if split is not None else "")
 					ax.bar(x + offset, vals, width=width, label=label)
 					idx += 1
 			ax.set_xticks(x)
@@ -1262,12 +1424,14 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 			ax.set_ylabel("Rate")
 			ax.set_title("How often agonists are top-ranked by each metric")
 			ax.grid(True, axis="y", alpha=0.3)
-			ax.legend(fontsize=8, ncols=2)
+			ax.legend(fontsize=10, ncols=2)
 			fig.tight_layout()
-			png = stats_dir / "agonist_metric_top_rates.png"
-			fig.savefig(png, dpi=220, bbox_inches="tight")
+			png = stats_dir / "agonist_metric_top_rates.pdf"
+			fig.savefig(png, dpi=300, bbox_inches="tight")
+			fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
 			pdf.savefig(fig, bbox_inches="tight")
 			paths.append(str(png))
+			paths.append(str(png.with_suffix(".pdf")))
 			plt.close(fig)
 		if corr_df is not None and not corr_df.empty:
 			target_preference = ["flip_any_rate", "abs_max_effect", "c2i_rate", "i2c_rate", "accuracy_gap"]
@@ -1279,24 +1443,27 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 					pivot = hdf.pivot_table(index="metric", columns="feature", values="spearman", aggfunc="first")
 					pivot = pivot.reindex([m for m in metric_order if m in pivot.index])
 					if not pivot.empty:
-						fig, ax = plt.subplots(figsize=(max(8, 1.5 * len(pivot.columns)), max(4, 0.7 * len(pivot.index))))
+						fig, ax = plt.subplots(figsize=(max(9.5, 1.25 * len(pivot.columns)), max(4.8, 0.9 * len(pivot.index))))
 						arr = pivot.to_numpy(dtype=float)
 						im = ax.imshow(arr, vmin=-1, vmax=1, aspect="auto")
 						ax.set_yticks(np.arange(len(pivot.index)))
 						ax.set_yticklabels([_metric_display(m) for m in pivot.index])
 						ax.set_xticks(np.arange(len(pivot.columns)))
-						ax.set_xticklabels([c.replace("delta_", "delta ").replace("_", " ") for c in pivot.columns], rotation=35, ha="right")
-						ax.set_title(f"Spearman correlation with {target}")
+						ax.set_xticklabels([_wrap_label(_pretty_col_label(c), width=16) for c in pivot.columns], rotation=0, ha="center")
+						ax.tick_params(axis="x", pad=7)
+						ax.set_title(f"Spearman correlation with {_pretty_col_label(target)}")
 						for i in range(arr.shape[0]):
 							for j in range(arr.shape[1]):
 								if np.isfinite(arr[i, j]):
-									ax.text(j, i, f"{arr[i, j]:.2f}", ha="center", va="center", fontsize=8)
+									ax.text(j, i, f"{arr[i, j]:.2f}", ha="center", va="center", fontsize=10)
 						fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 						fig.tight_layout()
-						png = stats_dir / "agonist_metric_correlation_heatmap.png"
-						fig.savefig(png, dpi=220, bbox_inches="tight")
+						png = stats_dir / "agonist_metric_correlation_heatmap.pdf"
+						fig.savefig(png, dpi=300, bbox_inches="tight")
+						fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
 						pdf.savefig(fig, bbox_inches="tight")
 						paths.append(str(png))
+						paths.append(str(png.with_suffix(".pdf")))
 						plt.close(fig)
 		if delta_df is not None and not delta_df.empty:
 			target = "flip_any_rate" if "flip_any_rate" in delta_df.columns and pd.to_numeric(delta_df["flip_any_rate"], errors="coerce").notna().sum() >= 3 else "abs_max_effect"
@@ -1312,15 +1479,17 @@ def _save_metric_plots(metric_df, delta_df, corr_df, stats_dir, topk=30):
 						ax.scatter(x[mask], y[mask], s=22, alpha=0.65, label=_metric_display(metric))
 				ax.axvline(0.0, linewidth=1, alpha=0.4)
 				ax.set_xlabel("Associated - unrelated mean layer percentile rank")
-				ax.set_ylabel(target)
-				ax.set_title(f"Metric contrast vs {target}")
+				ax.set_ylabel(_pretty_col_label(target))
+				ax.set_title(f"Metric contrast vs {_pretty_col_label(target)}")
 				ax.grid(True, alpha=0.25)
-				ax.legend(fontsize=8)
+				ax.legend(fontsize=10, frameon=True)
 				fig.tight_layout()
-				png = stats_dir / "agonist_metric_ablation_scatter.png"
-				fig.savefig(png, dpi=220, bbox_inches="tight")
+				png = stats_dir / "agonist_metric_ablation_scatter.pdf"
+				fig.savefig(png, dpi=300, bbox_inches="tight")
+				fig.savefig(png.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
 				pdf.savefig(fig, bbox_inches="tight")
 				paths.append(str(png))
+				paths.append(str(png.with_suffix(".pdf")))
 				plt.close(fig)
 	paths.append(str(pdf_path))
 	return paths
@@ -1946,6 +2115,12 @@ def write_high_quality_neuron_flip_coverage(
 			"perm_union_c2i": float(_p_c2i),
 			"perm_union_i2c": float(_p_i2c),
 		},
+		"figure_semantics": {
+			"prevalence_denominator": "Rows with at least one evaluated all-neuron flip column, not raw len(scores_df).",
+			"unique_union": "A prompt flipped by several neurons is counted once.",
+			"sum_over_neurons": "Per-neuron flip counts are summed, so overlaps are counted multiple times.",
+			"coverage_share": "High-quality union divided by all-neuron union for the same flip direction.",
+		},
 	}
 
 	json_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.json")
@@ -1976,61 +2151,205 @@ def write_high_quality_neuron_flip_coverage(
 	Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
 	print(f"[HighQuality] Wrote {tex_path}")
 
-	plt.figure(figsize=(11, 4.8))
-	fig = plt.gcf()
-	ax1 = plt.subplot(1, 2, 1)
-	counts = [len(total_neurons), len(high_neurons)]
-	x1 = np.arange(2)
-	bars1 = ax1.bar(x1, counts)
-	ax1.set_xticks(x1)
-	ax1.set_xticklabels(["All rules", f"{metric_label} ≥ {thr:.2f}"], rotation=0, ha="center")
-	ax1.set_ylabel("# neurons")
-	ax1.set_title("High-quality rules per neuron")
-	ax1.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
-	for b in bars1:
-		h = b.get_height()
-		ax1.annotate(f"{int(h)}", (b.get_x() + b.get_width()/2.0, h),
-					ha="center", va="bottom", fontsize=9, xytext=(0, 3), textcoords="offset points")
+	# Main figure: compact, paper-friendly, and collision-safe.
+	# Labels are placed with deterministic offsets/inside-bar placement so that equal-height bars
+	# (the common case in this plot) do not overlap.
+	eval_denom = float(n_eval_any_all) if n_eval_any_all else float(len(scores_df))
+	_label_box = dict(boxstyle="round,pad=0.14", facecolor="white", edgecolor="none", alpha=0.82)
 
-	ax2 = plt.subplot(1, 2, 2)
-	# Only show directional flips (exclude 'any' aggregate for clarity)
-	labels = ["correct→incorrect", "incorrect→correct"]
-	denom = len(scores_df) #float(n_eval_any_all) if n_eval_any_all else 0.0
-	union_all_pct = [
-		(100.0 * union_c2i_all / denom) if denom else float("nan"),
-		(100.0 * union_i2c_all / denom) if denom else float("nan"),
-	]
-	union_high_pct = [
-		(100.0 * union_c2i_high / denom) if denom else float("nan"),
-		(100.0 * union_i2c_high / denom) if denom else float("nan"),
-	]
-	x = np.arange(len(labels))
-	w = 0.36
-	bars2a = ax2.bar(x - w/2, union_all_pct, w, label="All neurons (union)")
-	bars2b = ax2.bar(x + w/2, union_high_pct, w, label="High-quality subset (union)")
-	ax2.set_xticks(x)
-	ax2.set_xticklabels(labels, rotation=0, ha="center")
-	ax2.set_ylabel("Flipped datapoints (% of evaluated prompts)")
-	ax2.set_title(f"Unique flips explained by high-quality neurons\n({metric_label} ≥ {thr:.2f})")
-	ax2.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+	def _bar_center(bar):
+		return bar.get_x() + bar.get_width() / 2.0
 
-	# Bar value labels
-	def _annotate_bars(ax, bars):
-		for b in bars:
+	def _annotate_bar_top(ax, bar, label, *, fontsize=7.0, xytext=(0, 2), ha="center"):
+		h = float(bar.get_height())
+		if h != h:
+			return
+		ax.annotate(
+			label,
+			(_bar_center(bar), h),
+			ha=ha,
+			va="bottom",
+			fontsize=fontsize,
+			xytext=xytext,
+			textcoords="offset points",
+			bbox=_label_box,
+			clip_on=False,
+		)
+
+	def _annotate_bar_inside(ax, bar, label, *, fontsize=6.8, frac=0.965):
+		h = float(bar.get_height())
+		if h != h:
+			return
+		if h <= 0:
+			_annotate_bar_top(ax, bar, label, fontsize=fontsize)
+			return
+		y_text = max(0.0, h * frac)
+		ax.annotate(
+			label,
+			(_bar_center(bar), y_text),
+			ha="center",
+			va="top",
+			fontsize=fontsize,
+			xytext=(0, -1),
+			textcoords="offset points",
+			bbox=_label_box,
+			clip_on=True,
+		)
+
+	def _annotate_grouped_pair(ax, left_bar, right_bar, left_label, right_label, *, fontsize=6.6):
+		# Outward alignment prevents the two labels over a same-height grouped pair from colliding.
+		for bar, label, ha, dx in (
+			(left_bar, left_label, "right", -2),
+			(right_bar, right_label, "left", 2),
+		):
+			h = float(bar.get_height())
+			if h != h:
+				continue
+			ax.annotate(
+				label,
+				(_bar_center(bar), h),
+				ha=ha,
+				va="bottom",
+				fontsize=fontsize,
+				xytext=(dx, 2),
+				textcoords="offset points",
+				bbox=_label_box,
+				clip_on=False,
+			)
+
+	with plt.rc_context({
+		"font.size": 8,
+		"axes.titlesize": 9,
+		"axes.labelsize": 8,
+		"xtick.labelsize": 7.4,
+		"ytick.labelsize": 7.4,
+		"legend.fontsize": 7.0,
+	}):
+		fig, axes = plt.subplots(2, 2, figsize=(7.05, 5.65), constrained_layout=False)
+		fig.subplots_adjust(left=0.08, right=0.995, bottom=0.115, top=0.955, wspace=0.24, hspace=0.34)
+		ax_counts, ax_prev = axes[0]
+		ax_cov, ax_overlap = axes[1]
+
+		pop_labels = ["All", f"High-quality\n({metric_label} ≥ {thr:.2f})"]
+		pop_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None])[:2]
+		if len(pop_colors) < 2:
+			pop_colors = [None, None]
+
+		dir_labels = ["Any flip", "Correct→incorrect", "Incorrect→correct"]
+		dir_tick_labels = [_wrap_label(s, 12) for s in dir_labels]
+		x = np.arange(len(dir_labels))
+		w = 0.34
+
+		# A. Subset size.
+		counts = np.asarray([len(total_neurons), len(high_neurons)], dtype=float)
+		bars = ax_counts.bar(np.arange(2), counts, width=0.62, color=pop_colors)
+		ax_counts.set_xticks(np.arange(2))
+		ax_counts.set_xticklabels(pop_labels)
+		ax_counts.set_ylabel("# neurons")
+		ax_counts.set_title("Subset size", pad=4)
+		ax_counts.set_ylim(0, max(1.0, float(np.nanmax(counts)) * 1.20 if len(counts) else 1.0))
+		ax_counts.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		for i, b in enumerate(bars):
 			h = b.get_height()
-			if h == h:  # not NaN
-				ax.annotate(f"{h:.1f}%", (b.get_x() + b.get_width()/2.0, h),
-							ha="center", va="bottom", fontsize=8, xytext=(0, 3), textcoords="offset points")
-	_annotate_bars(ax2, bars2a)
-	_annotate_bars(ax2, bars2b)
+			pct = (100.0 * h / float(len(total_neurons))) if len(total_neurons) else float("nan")
+			lab = f"{int(h)}"
+			if i == 1 and pct == pct:
+				lab += f"\n({pct:.1f}%)"
+			_annotate_bar_top(ax_counts, b, lab, fontsize=7.2)
 
-	# Legend
-	# pnote = f"p: c→i {_fmt_p(_p_c2i)}, i→c {_fmt_p(_p_i2c)}"
-	# if pnote.strip() != "p: c→i , i→c":
-	# 	ax2.text(0.02, 0.98, pnote, transform=ax2.transAxes,
-	# 			 ha="left", va="top", fontsize=8)
+		# B. Prompt-level prevalence of unique flips.
+		all_union = np.asarray([union_any_all, union_c2i_all, union_i2c_all], dtype=float)
+		hq_union = np.asarray([union_any_high, union_c2i_high, union_i2c_high], dtype=float)
+		all_prev = 100.0 * all_union / eval_denom if eval_denom else np.asarray([np.nan] * 3)
+		hq_prev = 100.0 * hq_union / eval_denom if eval_denom else np.asarray([np.nan] * 3)
+		bars_all = ax_prev.bar(x - w/2, all_prev, width=w, label="All", color=pop_colors[0])
+		bars_hq = ax_prev.bar(x + w/2, hq_prev, width=w, label="HQ", color=pop_colors[1])
+		ax_prev.set_xticks(x)
+		ax_prev.set_xticklabels(dir_tick_labels)
+		ax_prev.set_ylabel("Unique flips (%)")
+		ax_prev.set_title("Flip prevalence", pad=4)
+		prev_top = np.nanmax(np.concatenate([all_prev, hq_prev])) if np.isfinite(np.concatenate([all_prev, hq_prev])).any() else 1.0
+		ax_prev.set_ylim(0, max(1.0, float(prev_top) * 1.24))
+		ax_prev.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		ax_prev.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
+		for b_l, b_r, cnt_l, cnt_r in zip(bars_all, bars_hq, all_union, hq_union):
+			_annotate_grouped_pair(
+				ax_prev,
+				b_l,
+				b_r,
+				f"{b_l.get_height():.1f}%\n{int(cnt_l)}",
+				f"{b_r.get_height():.1f}%\n{int(cnt_r)}",
+				fontsize=6.4,
+			)
+
+		# C. Direct coverage question: how much of all discovered flip behavior is covered by HQ neurons?
+		coverage = np.asarray([
+			(float(union_any_high) / float(union_any_all)) if union_any_all else np.nan,
+			(float(union_c2i_high) / float(union_c2i_all)) if union_c2i_all else np.nan,
+			(float(union_i2c_high) / float(union_i2c_all)) if union_i2c_all else np.nan,
+		], dtype=float)
+		coverage_pct = 100.0 * coverage
+		bars_cov = ax_cov.bar(x, coverage_pct, width=0.56, color=pop_colors[1])
+		ax_cov.set_xticks(x)
+		ax_cov.set_xticklabels(dir_tick_labels)
+		ax_cov.set_ylim(0, max(100.0, np.nanmax(coverage_pct) * 1.08 if np.isfinite(coverage_pct).any() else 100.0))
+		ax_cov.set_ylabel("HQ / all union (%)")
+		ax_cov.set_title("Coverage share", pad=4)
+		ax_cov.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		pvals = [_p_any, _p_c2i, _p_i2c]
+		pairs = [(union_any_high, union_any_all), (union_c2i_high, union_c2i_all), (union_i2c_high, union_i2c_all)]
+		for b, pct, (num, den), p in zip(bars_cov, coverage_pct, pairs, pvals):
+			if pct == pct:
+				plab = _fmt_p(p)
+				lab = f"{pct:.1f}%\n{int(num)}/{int(den)}"
+				if plab:
+					lab += f"\np={plab}"
+				# For near-100% bars, place labels inside the bar so they cannot hit the panel title.
+				if pct >= 70:
+					_annotate_bar_inside(ax_cov, b, lab, fontsize=6.5, frac=0.975)
+				else:
+					_annotate_bar_top(ax_cov, b, lab, fontsize=6.5)
+
+		# D. Overlap / redundancy: sum-over-neurons vs unique union.
+		def _ratio(sum_v, union_v):
+			return (float(sum_v) / float(union_v)) if union_v else np.nan
+
+		overlap_all = np.asarray([
+			_ratio(sum_any_all, union_any_all),
+			_ratio(sum_c2i_all, union_c2i_all),
+			_ratio(sum_i2c_all, union_i2c_all),
+		], dtype=float)
+		overlap_hq = np.asarray([
+			_ratio(sum_any_high, union_any_high),
+			_ratio(sum_c2i_high, union_c2i_high),
+			_ratio(sum_i2c_high, union_i2c_high),
+		], dtype=float)
+		bars_oa = ax_overlap.bar(x - w/2, overlap_all, width=w, label="All", color=pop_colors[0])
+		bars_oh = ax_overlap.bar(x + w/2, overlap_hq, width=w, label="HQ", color=pop_colors[1])
+		ax_overlap.axhline(1.0, linewidth=0.8, alpha=0.45)
+		ax_overlap.set_xticks(x)
+		ax_overlap.set_xticklabels(dir_tick_labels)
+		ax_overlap.set_ylabel("Sum / union")
+		ax_overlap.set_title("Overlap", pad=4)
+		overlap_top = np.nanmax(np.concatenate([overlap_all, overlap_hq])) if np.isfinite(np.concatenate([overlap_all, overlap_hq])).any() else 1.0
+		ax_overlap.set_ylim(0, max(1.0, float(overlap_top) * 1.22))
+		ax_overlap.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		ax_overlap.legend(loc="upper right", frameon=False, ncol=2, handlelength=1.0, columnspacing=0.7, borderpad=0.1)
+
+		# Ratio-only labels in this dense panel prevent the count labels from colliding.
+		# Exact numerator/denominator values remain in high_quality_neuron_flip_coverage.json.
+		for b_l, b_r in zip(bars_oa, bars_oh):
+			_annotate_grouped_pair(
+				ax_overlap,
+				b_l,
+				b_r,
+				f"{b_l.get_height():.2f}×",
+				f"{b_r.get_height():.2f}×",
+				fontsize=6.5,
+			)
+
 	plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"high_quality_neuron_flip_coverage.pdf")
-	plt.savefig(plot_path, dpi=250, bbox_inches='tight')
+	plt.savefig(plot_path, dpi=300, bbox_inches='tight', pad_inches=0.02)
 	plt.close()
 	print(f"[HighQuality] Wrote {plot_path}")
 	
@@ -2545,14 +2864,15 @@ def main():
 		# - If you later decide to embed only train rows, set split_tag="train"
 		split_tag = "all"
 
-		spectral_cfg = _spectral_cache_cfg(
-			args=args,
-			ai_model=ai_model,
-			scores_path=scores_path,
-			prompt_col=prompt_col,
-			split_tag=split_tag,
-		)
-		spectral_cache_fp = _spectral_cache_path(args, spectral_cfg)
+		# spectral_cfg = _spectral_cache_cfg(
+		# 	args=args,
+		# 	ai_model=ai_model,
+		# 	scores_path=scores_path,
+		# 	prompt_col=prompt_col,
+		# 	split_tag=split_tag,
+		# )
+		# spectral_cache_fp = _spectral_cache_path(args, spectral_cfg)
+		spectral_cache_fp = _spectral_cache_path(args)
 
 		def _compute_spectral_sampling():
 			emb_all, Z = build_reps_and_embedding_from_args(
@@ -3028,7 +3348,24 @@ def main():
 	scores_out.to_csv(os.path.join(args.rules_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
 
 	# ----------------- aggregate flip stats (per neuron) -----------------
-	flip_stats_df = write_flip_stats(scores_out, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname)
+	scores_for_final_stats = scores_out
+	if getattr(args, "exclude_discovery_rows_from_final_stats", False):
+		discovery_orig_rows = collect_discovery_original_rows(circuit_agonists_path, scores_df)
+		scores_for_final_stats = filter_scores_out_for_final_stats(scores_out, discovery_orig_rows)
+		excluded_n = int(len(scores_out) - len(scores_for_final_stats))
+		Path(os.path.join(args.rules_dir, 'stats', args.stats_dirname)).mkdir(parents=True, exist_ok=True)
+		exclusion_payload = {
+			"exclude_discovery_rows_from_final_stats": True,
+			"n_discovery_original_rows_found": int(len(discovery_orig_rows)),
+			"n_rows_excluded_from_scores_out": excluded_n,
+			"n_rows_remaining_for_final_stats": int(len(scores_for_final_stats)),
+		}
+		Path(os.path.join(args.rules_dir, 'stats', args.stats_dirname, 'final_stats_exclusion.json')).write_text(
+			json.dumps(exclusion_payload, indent=2, ensure_ascii=False),
+			encoding="utf-8",
+		)
+		print(f"[Stats] Excluded {excluded_n} discovery-overlap rows before final flip stats.")
+	flip_stats_df = write_flip_stats(scores_for_final_stats, neurons, args.rules_dir, topk=50, stats_dirname=args.stats_dirname)
 	if not getattr(args, "skip_agonist_metric_stats", False):
 		write_agonist_metric_final_stats(
 			circuit_agonists_path,
