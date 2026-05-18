@@ -74,7 +74,8 @@ run_analyze() {
     --baseline_subset "${baseline_subset}" \
     --sampling_strategy plan \
     --sampling_plan_path "${plan_path}" \
-    --sign_split_first 
+    --sign_split_first \
+    --decode_only
 }
 
 run_analyze "positive" "${DISCOVERY_OUT_DIR}/${CANDIDATE_BAG_LABEL}/positive_baseline"
@@ -98,6 +99,7 @@ python3 7_refine_neuron_anchored_rules.py \
   --intervention "${INTERVENTION}" \
   --extract_rules \
   --only_unique_datapoints_in_shap \
+  --decode_only \
   --summarize_rule_metrics
 
 python3 summarize_intervention_shift.py \

@@ -17,13 +17,8 @@ EXPERIMENT_LIST=(
 )
 
 ANALYZED_LLM_LIST=(
-	### Coding
-	# "microsoft/Phi-3-mini-4k-instruct"
 	"Qwen/Qwen2-1.5B-Instruct"
-	### Non-coding
-	"Qwen/Qwen2-7B-Instruct"
-	# "EleutherAI/gpt-j-6B"
-	# "EleutherAI/pythia-6.9b"
+	# "Qwen/Qwen2-7B-Instruct"
 )
 
 # Fallback if experiment not listed explicitly

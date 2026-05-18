@@ -14,10 +14,10 @@ EXPERIMENT_LIST=(
 )
 
 ANALYZED_LLM_LIST=(
-	# "Qwen/Qwen2-1.5B-Instruct"
+	"Qwen/Qwen2-1.5B-Instruct"
 	"Qwen/Qwen2-7B-Instruct"
 	"EleutherAI/gpt-j-6B"
-	"EleutherAI/pythia-6.9b"
+	# "EleutherAI/pythia-6.9b"
 	### Extra
 	# "mistralai/Mistral-7B-Instruct-v0.1"
 	# "swiss-ai/Apertus-8B-Instruct-2509" # not supported by TransformerLens
@@ -35,51 +35,51 @@ for EXPERIMENT in "${EXPERIMENT_LIST[@]}"; do
 
 	# Experiment-level defaults
 	BASE_Z_THRESH="$DEFAULT_Z_THRESH"
-	MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=1
 	BATCH_SIZE="$DEFAULT_BATCH_SIZE"
 	CIRCUIT_LEVEL="$DEFAULT_CIRCUIT_LEVEL"
 	CIRCUIT_SIZE="$DEFAULT_CIRCUIT_SIZE"
 	EVAL_INTERVENTION="mean-positional"
 	NEURONS_TYPE_FLAG=(--mlp_neurons_only)
-	DECODE_ONLY_FLAG=()
 
 	for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 		# Reset per-model defaults so flags/settings do not leak between LLMs.
 		Z_THRESH="$BASE_Z_THRESH"
 		BATCH_SIZE="$DEFAULT_BATCH_SIZE"
-		DECODE_ONLY_FLAG=()
+		MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=1
+		DECODE_ONLY_FLAG=(--decode_only)
 
 		case "$EXPERIMENT" in
 			arithmetic)
-				# Arithmetic should be decode-only for every model except Qwen/Qwen2-1.5B-Instruct.
-				DECODE_ONLY_FLAG=(--decode_only)
-				# MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=5
 				BATCH_SIZE=256
 				case "$ANALYZED_LLM" in
 					Qwen/Qwen2-1.5B-Instruct)
-						DECODE_ONLY_FLAG=()
 						Z_THRESH=10
 						;;
 					Qwen/*)
+						MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=5
 						Z_THRESH=10
 						;;
 					*)
+						MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=5
 						Z_THRESH=5
 						;;
 				esac
 				;;
 			bon_jailbreaking)
-				DECODE_ONLY_FLAG=(--decode_only)
 				case "$ANALYZED_LLM" in
+					Qwen/Qwen2-1.5B-Instruct)
+						;;
 					Qwen/*)
+						MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=3
 						BATCH_SIZE=256
+						;;
+					*)
 						;;
 				esac
 				;;
-			# hans_nli)
-			# 	# NEURONS_TYPE_FLAG=()
-			# 	DECODE_ONLY_FLAG=()
-			# 	;;
+			hans_nli)
+				DECODE_ONLY_FLAG=()
+				;;
 		esac
 
 		STATS_DIR=./data/$EXPERIMENT/$ANALYZED_LLM/rule_extraction_results/neuron_flip_rules/stats
