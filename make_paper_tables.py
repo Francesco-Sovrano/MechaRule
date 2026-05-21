@@ -5,6 +5,7 @@ import argparse
 import ast
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -12,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-RUN_CONFIGS: Dict[str, Dict[str, Any]] = {
+RUN_CONFIGS = {
     "rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor": {
         "display": "Rule split + spectral coverage",
         "split_dir": "rule_split-spectral_sample-decode_only",
@@ -57,6 +58,24 @@ TABLE2_RUNS = [
 
 DEFAULT_THRESHOLDS = [0.80, 0.85, 0.90, 0.95, 0.99]
 DEFAULT_TABLE3_BINS = [0.2, 0.3, 0.5, 1.0]
+
+# Main paper tables intentionally cover arithmetic and jailbreaking.
+# HANS/NLI is an appendix task and can be included with the CLI flag.
+DEFAULT_MAIN_TASKS = ("arithmetic", "bon_jailbreaking", "jailbreaking")
+
+SENSITIVITY_ARTIFACT_PATTERNS = (
+    re.compile(r"-M\d+"),
+    re.compile(r"-tau0\.\d"),
+)
+
+
+def _is_sensitivity_artifact_path(path: Path) -> bool:
+    """Return True when any path component looks like a sensitivity artefact."""
+    return any(
+        pattern.search(part)
+        for part in path.parts
+        for pattern in SENSITIVITY_ARTIFACT_PATTERNS
+    )
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -166,6 +185,8 @@ def _find_model_roots(data_root: Path, tasks: Optional[Sequence[str]] = None) ->
             rel = model_root.relative_to(data_root)
         except Exception:
             continue
+        if _is_sensitivity_artifact_path(rel):
+            continue
         if len(rel.parts) < 3:
             continue
         task = rel.parts[0]
@@ -174,6 +195,31 @@ def _find_model_roots(data_root: Path, tasks: Optional[Sequence[str]] = None) ->
         roots.append(model_root)
     unique = sorted({p.resolve() for p in roots})
     return unique
+
+
+def _find_feature_model_roots(data_root: Path, tasks: Optional[Sequence[str]] = None) -> List[Path]:
+    data_root = data_root.resolve()
+    roots: List[Path] = []
+    task_filter = {t.strip() for t in tasks} if tasks else None
+    for feature_dir in data_root.rglob("feature_report"):
+        model_root = feature_dir.parent
+        try:
+            rel = model_root.relative_to(data_root)
+        except Exception:
+            continue
+        if _is_sensitivity_artifact_path(rel):
+            continue
+        if len(rel.parts) < 3:
+            continue
+        task = rel.parts[0]
+        if task_filter and task not in task_filter:
+            continue
+        roots.append(model_root)
+    return sorted({p.resolve() for p in roots})
+
+
+def _find_model_or_feature_roots(data_root: Path, tasks: Optional[Sequence[str]] = None) -> List[Path]:
+    return sorted({*map(Path.resolve, _find_model_roots(data_root, tasks=tasks)), *map(Path.resolve, _find_feature_model_roots(data_root, tasks=tasks))})
 
 
 def _task_org_model(data_root: Path, model_root: Path) -> Tuple[str, str, str]:
@@ -190,37 +236,144 @@ def _model_root_from_spec(data_root: Path, task: str, model_spec: str) -> Path:
     return (data_root / task / org / model).resolve()
 
 
+def _unique_preserve_order(items: Iterable[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for item in items:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _path_aliases(name: str) -> List[str]:
+    """Return compatible artifact-directory aliases, exact name first.
+
+    Some result trees use `...-decode_only...`, while older appendix/HANS
+    artifacts omit `-decode_only`.  The exact path is always preferred so the
+    helper does not change results when both layouts exist.
+    """
+    aliases = [str(name)]
+    if "-decode_only" in str(name):
+        aliases.append(str(name).replace("-decode_only", ""))
+    return _unique_preserve_order(aliases)
+
+
 def _stats_dir(model_root: Path, run_name: str) -> Path:
     return model_root / "rule_extraction_results" / "neuron_flip_rules" / "stats" / run_name
 
 
+def _stats_dir_candidates(model_root: Path, run_name: str) -> List[Path]:
+    return [_stats_dir(model_root, cand) for cand in _path_aliases(run_name)]
+
+
+def _resolve_stats_dir(model_root: Path, run_name: str) -> Path:
+    for path in _stats_dir_candidates(model_root, run_name):
+        if path.exists():
+            return path
+    return _stats_dir(model_root, run_name)
+
+
+def _localization_dir_candidates(model_root: Path, run_name: str, baseline_subset: str = "positive_baseline") -> List[Path]:
+    cfg = RUN_CONFIGS[run_name]
+    base_name = "neural_circuit_discovery_results_fake_targets" if cfg.get("fake") else "neural_circuit_discovery_results"
+    base = model_root / base_name / "eap_ig_inputs"
+    candidates = []
+    for split_dir in _path_aliases(cfg["split_dir"]):
+        candidates.append(base / split_dir / cfg["anchor_dir"] / baseline_subset)
+    return _unique_preserve_order(candidates)
+
+
 def _localization_dir(model_root: Path, run_name: str, baseline_subset: str = "positive_baseline") -> Path:
+    # Backwards-compatible canonical path; use _resolve_localization_dir for reads.
     cfg = RUN_CONFIGS[run_name]
     base_name = "neural_circuit_discovery_results_fake_targets" if cfg.get("fake") else "neural_circuit_discovery_results"
     return model_root / base_name / "eap_ig_inputs" / cfg["split_dir"] / cfg["anchor_dir"] / baseline_subset
 
 
+def _resolve_localization_dir(model_root: Path, run_name: str, baseline_subset: str = "positive_baseline") -> Path:
+    for path in _localization_dir_candidates(model_root, run_name, baseline_subset=baseline_subset):
+        if path.exists():
+            return path
+    return _localization_dir(model_root, run_name, baseline_subset=baseline_subset)
+
+
 def _discovery_manifest_path(model_root: Path, run_name: str) -> Path:
     cfg = RUN_CONFIGS[run_name]
     base_name = "neural_circuit_discovery_results_fake_targets" if cfg.get("fake") else "neural_circuit_discovery_results"
+    base = model_root / base_name / "eap_ig_inputs"
 
-    base = model_root / base_name / "eap_ig_inputs" / cfg["split_dir"]
+    candidates: List[Path] = []
+    for split_dir in _path_aliases(cfg["split_dir"]):
+        split_base = base / split_dir
+        candidates.extend([
+            split_base / "neural_circuits" / "manifest.json",
+            split_base / "manifest.json",
+            split_base / cfg["anchor_dir"] / "neural_circuits" / "manifest.json",
+            split_base / cfg["anchor_dir"] / "manifest.json",
+        ])
 
-    candidates = [
-        base / "neural_circuits" / "manifest.json",   # correct path in this repo
-        base / "manifest.json",                       # old fallback
-        base / cfg["anchor_dir"] / "neural_circuits" / "manifest.json",  # extra fallback
-        base / cfg["anchor_dir"] / "manifest.json",                    # extra fallback
-    ]
-
-    for path in candidates:
+    for path in _unique_preserve_order(candidates):
         if path.exists():
             return path
 
-    searched = "\n".join(str(p) for p in candidates)
+    searched = "\n".join(str(p) for p in _unique_preserve_order(candidates))
     raise FileNotFoundError(
         f"Manifest not found for run '{run_name}'. Looked in:\n{searched}"
     )
+
+
+def _feature_dataset_stats_path(model_root: Path) -> Optional[Path]:
+    path = model_root / "feature_report" / "dataset_stats.json"
+    return path if path.exists() else None
+
+
+def _normalise_unit_rate(value: Any) -> float:
+    val = _safe_float(value)
+    if val != val:
+        return val
+    # Most files store fractions in [0, 1].  Accept 0-100 percentages defensively.
+    if 1.0 < val <= 100.0:
+        return val / 100.0
+    return val
+
+
+def _metric_from_dataset_stats(model_root: Path, task: str) -> Optional[Tuple[str, float]]:
+    path = _feature_dataset_stats_path(model_root)
+    if path is None:
+        return None
+    stats = _read_json(path)
+    task_l = str(task).lower()
+
+    if "jailbreak" in task_l:
+        candidates = [
+            ("Jailbreak rate", "jailbreak_rate"),
+            ("Jailbreak rate", "pct_is_jailbroken"),
+            ("Jailbreak rate", "is_jailbroken_rate"),
+        ]
+    else:
+        candidates = [
+            ("Accuracy", "accuracy"),
+            ("Accuracy", "pct_is_correct"),
+            ("Accuracy", "is_correct_rate"),
+        ]
+
+    # Also handle files where only one obvious task metric is present.
+    candidates.extend([
+        ("Jailbreak rate", "jailbreak_rate"),
+        ("Jailbreak rate", "pct_is_jailbroken"),
+        ("Accuracy", "accuracy"),
+        ("Accuracy", "pct_is_correct"),
+    ])
+
+    for metric, key in candidates:
+        if key in stats:
+            value = _normalise_unit_rate(stats[key])
+            if value == value:
+                return metric, value
+    return None
 
 
 def _feature_scores_path(model_root: Path) -> Optional[Path]:
@@ -365,10 +518,10 @@ def _extract_flip_share_from_global(stats: Dict[str, Any], direction: str) -> fl
     return best_val
 
 
-def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.DataFrame:
+def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, coverage_source: str = "all") -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for model_root in _find_model_roots(data_root):
-        stats_dir = _stats_dir(model_root, run_name)
+    for model_root in _find_model_roots(data_root, tasks=tasks):
+        stats_dir = _resolve_stats_dir(model_root, run_name)
         hq_path = stats_dir / "high_quality_neuron_flip_coverage.json"
         global_path = stats_dir / "flip_stats_global.json"
         if not hq_path.exists() and not global_path.exists():
@@ -377,12 +530,18 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Data
         flip_global = _read_json(global_path) if global_path.exists() else {}
         task, org, model = _task_org_model(data_root, model_root)
 
-        c2i_share = _extract_flip_share_from_global(flip_global, "c2i")
-        i2c_share = _extract_flip_share_from_global(flip_global, "i2c")
-        if c2i_share != c2i_share:
+        if coverage_source == "hq":
             c2i_share = _safe_float((hq.get("flip_c2i") or {}).get("union_share_of_all"))
-        if i2c_share != i2c_share:
             i2c_share = _safe_float((hq.get("flip_i2c") or {}).get("union_share_of_all"))
+        else:
+            # Paper definition: union flip coverage over all rule-bearing localized neurons.
+            # Fall back to the HQ coverage file only when the all-neuron/global artifact is absent.
+            c2i_share = _extract_flip_share_from_global(flip_global, "c2i")
+            i2c_share = _extract_flip_share_from_global(flip_global, "i2c")
+            if c2i_share != c2i_share:
+                c2i_share = _safe_float((hq.get("flip_c2i") or {}).get("union_share_of_all"))
+            if i2c_share != i2c_share:
+                i2c_share = _safe_float((hq.get("flip_i2c") or {}).get("union_share_of_all"))
 
         rows.append({
             "Task": _pretty_task(task),
@@ -401,17 +560,23 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Data
     df["_ot"] = df["Task"].map(order_task).fillna(99)
     df["_om"] = df["Model"].map(order_model).fillna(99)
     df = df.sort_values(["_ot", "_om", "task_key", "model_key"]).drop(columns=["_ot", "_om", "task_key", "model_key"])
-    _write_table_artifacts(df, out_dir, "table1_main_high_quality_neurons", caption="Table 1: High-quality neuron-anchored rules and flip coverage.")
+    caption = (
+        "Table 1: End-to-end rule split + spectral coverage results. HQ neurons have held-out MCC >= 0.85; "
+        "union flip coverage includes all rule-bearing localized neurons."
+        if coverage_source != "hq"
+        else "Table 1: High-quality neuron-anchored rules and HQ-only flip coverage."
+    )
+    _write_table_artifacts(df, out_dir, "table1_main_high_quality_neurons", caption=caption)
     return df
 
 
-def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_names: Sequence[str] = TABLE2_RUNS) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_names: Sequence[str] = TABLE2_RUNS, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS) -> Tuple[pd.DataFrame, pd.DataFrame]:
     per_run_rows: List[Dict[str, Any]] = []
-    model_roots = _find_model_roots(data_root)
+    model_roots = _find_model_roots(data_root, tasks=tasks)
     for model_root in model_roots:
         task, org, model = _task_org_model(data_root, model_root)
         for run_name in run_names:
-            stats_dir = _stats_dir(model_root, run_name)
+            stats_dir = _resolve_stats_dir(model_root, run_name)
             csv_path = stats_dir / "rule_combo_metrics_best_per_neuron.csv"
             if not csv_path.exists():
                 continue
@@ -553,20 +718,33 @@ def _compact_recall_cell(recovered: int, total: int) -> str:
     return f"{int(recovered)}/{int(total)} ({100.0 * float(recovered) / float(total):.1f}%)"
 
 
-def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float]) -> List[Dict[str, Any]]:
+def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float], tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, model_spec: Optional[str] = None, baseline_subsets: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     min_effect = float(min(bins[:-1])) if len(bins) > 1 else float(min(bins))
-    baseline_map = {
+    baseline_map_all = {
         "positive_baseline": "positive",
         "negative_baseline": "negative",
     }
-    for model_root in _find_model_roots(data_root):
+    if baseline_subsets is None:
+        baseline_map = baseline_map_all
+    else:
+        baseline_map = {k: baseline_map_all[k] for k in baseline_subsets if k in baseline_map_all}
+
+    model_filter: Optional[Tuple[str, str]] = None
+    if model_spec:
+        if "/" not in model_spec:
+            raise ValueError(f"Model spec must look like ORG/MODEL, got: {model_spec}")
+        model_filter = tuple(model_spec.split("/", 1))  # type: ignore[assignment]
+
+    for model_root in _find_model_roots(data_root, tasks=tasks):
         task, org, model = _task_org_model(data_root, model_root)
+        if model_filter is not None and (org, model) != model_filter:
+            continue
         pretty_task = _pretty_task(task)
         pretty_model = _pretty_model(org, model)
         for baseline_subset, baseline_label in baseline_map.items():
-            bf_dir = _localization_dir(model_root, BF_RUN, baseline_subset=baseline_subset)
-            cha_dir = _localization_dir(model_root, MAIN_RUN, baseline_subset=baseline_subset)
+            bf_dir = _resolve_localization_dir(model_root, BF_RUN, baseline_subset=baseline_subset)
+            cha_dir = _resolve_localization_dir(model_root, MAIN_RUN, baseline_subset=baseline_subset)
             if not ((bf_dir / "neuron_buckets.json").exists() and (cha_dir / "neuron_buckets.json").exists()):
                 continue
             bf_circuit_ids = _collect_circuit_ids_from_buckets(bf_dir)
@@ -651,22 +829,48 @@ def _table3_aggregate_records(records: Sequence[Dict[str, Any]], bins: Sequence[
     return df
 
 
-def _table3(data_root: Path, out_dir: Path, task: str, model_spec: str, tau: float, bins: Sequence[float], baseline_subset: str) -> pd.DataFrame:
-    records = _table3_collect_baseline_records(data_root, bins=bins)
+def _table3(
+    data_root: Path,
+    out_dir: Path,
+    task: str,
+    model_spec: str,
+    tau: float,
+    bins: Sequence[float],
+    baseline_subset: str,
+    scope: str = "all",
+) -> pd.DataFrame:
+    if scope == "selected":
+        records = _table3_collect_baseline_records(
+            data_root,
+            bins=bins,
+            tasks=[task],
+            model_spec=model_spec,
+            baseline_subsets=[baseline_subset],
+        )
+    else:
+        records = _table3_collect_baseline_records(data_root, bins=bins, tasks=DEFAULT_MAIN_TASKS)
+
     df = _table3_aggregate_records(records, bins=bins, include_per_model=True)
     _write_table_artifacts(
         df,
         out_dir,
         "table3_compact_bf_vs_cha",
-        caption="Table 3: Compact BF-vs-CHA comparison for rule split + spectral coverage vs. rule split + brute-force search, restricted to the brute-force circuit(s).",
+        caption=(
+            "Table 3: Compact BF-vs-CHA comparison for rule split + spectral coverage vs. brute-force search. "
+            "Counts are baseline-specific and CHA recovery is restricted to the brute-force circuit(s)."
+        ),
     )
     meta = {
         "compared_runs": {
             "cha": MAIN_RUN,
             "bruteforce": BF_RUN,
         },
+        "counting_unit": "baseline-specific neuron_buckets.json entries from non_catastrophic_agonists",
         "cha_scope": "filtered to circuit_id values observed in the corresponding brute-force neuron_buckets.json",
+        "effect_threshold_for_table3": float(bins[0]) if bins else float(tau),
+        "note_on_tau": "Table 3 is binned by --table3_bins; --tau is used by Table 13 and only affects Table 3 when bins are changed accordingly.",
         "bins": list(map(float, bins)),
+        "scope": scope,
         "n_completed_baseline_records": int(len(records)),
         "records": [
             {
@@ -689,26 +893,30 @@ def _table3(data_root: Path, out_dir: Path, task: str, model_spec: str, tau: flo
 
 def _table9(data_root: Path, out_dir: Path) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for model_root in _find_model_roots(data_root):
+    for model_root in _find_model_or_feature_roots(data_root):
         task, org, model = _task_org_model(data_root, model_root)
-        scores_path = _feature_scores_path(model_root)
-        if scores_path is None:
-            continue
-        df = _load_scores_df(scores_path)
-        metric = None
-        value = float("nan")
-        if "is_jailbroken" in df.columns:
-            metric = "Jailbreak rate"
-            value = pd.to_numeric(df["is_jailbroken"], errors="coerce").mean()
-        elif "is_correct" in df.columns:
-            metric = "Accuracy"
-            value = pd.to_numeric(df["is_correct"], errors="coerce").mean()
-        elif any(c.startswith("is_") for c in df.columns):
-            cols = [c for c in df.columns if c.startswith("is_")]
-            metric = cols[0]
-            value = pd.to_numeric(df[cols[0]], errors="coerce").mean()
-        if metric is None or value != value:
-            continue
+        metric_value = _metric_from_dataset_stats(model_root, task)
+        if metric_value is not None:
+            metric, value = metric_value
+        else:
+            scores_path = _feature_scores_path(model_root)
+            if scores_path is None:
+                continue
+            df = _load_scores_df(scores_path)
+            metric = None
+            value = float("nan")
+            if "is_jailbroken" in df.columns:
+                metric = "Jailbreak rate"
+                value = pd.to_numeric(df["is_jailbroken"], errors="coerce").mean()
+            elif "is_correct" in df.columns:
+                metric = "Accuracy"
+                value = pd.to_numeric(df["is_correct"], errors="coerce").mean()
+            elif any(c.startswith("is_") for c in df.columns):
+                cols = [c for c in df.columns if c.startswith("is_")]
+                metric = cols[0]
+                value = pd.to_numeric(df[cols[0]], errors="coerce").mean()
+            if metric is None or value != value:
+                continue
         rows.append({
             "Task": _pretty_task(task),
             "Model": _pretty_model(org, model),
@@ -765,26 +973,31 @@ def _aggregate_eapig_neurons(manifest_path: Path) -> pd.DataFrame:
     return out
 
 
-def _top_cha_neurons(stats_dir: Path, top_n: int = 50) -> pd.DataFrame:
+def _top_cha_neurons(stats_dir: Path, top_n: int = 50, rank_metric: str = "c2i") -> pd.DataFrame:
     flip_path = stats_dir / "flip_stats_by_neuron.csv"
     if not flip_path.exists():
         return pd.DataFrame()
     df = pd.read_csv(flip_path, low_memory=False)
-    for col in ["c2i_rate", "c2i_count", "flip_any_rate", "flip_any_count"]:
+    for col in ["c2i_rate", "c2i_count", "i2c_rate", "i2c_count", "flip_any_rate", "flip_any_count"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "layer_label" not in df.columns and "neuron" in df.columns:
         df["layer_label"] = df["neuron"].astype(str).str.split(":").str[0]
     if "neuron" not in df.columns and {"layer_label", "neuron_id"}.issubset(df.columns):
         df["neuron"] = df["layer_label"].astype(str) + ":" + df["neuron_id"].astype(int).astype(str)
-    sort_cols = [c for c in ["c2i_rate", "c2i_count", "flip_any_rate", "flip_any_count"] if c in df.columns]
+    rank_orders = {
+        "c2i": ["c2i_rate", "c2i_count", "flip_any_rate", "flip_any_count"],
+        "i2c": ["i2c_rate", "i2c_count", "flip_any_rate", "flip_any_count"],
+        "flip_any": ["flip_any_rate", "flip_any_count", "c2i_rate", "c2i_count"],
+    }
+    sort_cols = [c for c in rank_orders.get(rank_metric, rank_orders["c2i"]) if c in df.columns]
     if not sort_cols:
         return pd.DataFrame()
     df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(int(top_n)).reset_index(drop=True)
     return df
 
 
-def _table10(data_root: Path, out_dir: Path, task: str, model_spec: str, run_name: str, top_n: int) -> pd.DataFrame:
+def _table10(data_root: Path, out_dir: Path, task: str, model_spec: str, run_name: str, top_n: int, cha_rank_metric: str = "c2i") -> pd.DataFrame:
     model_root = _model_root_from_spec(data_root, task, model_spec)
     try:
         manifest_path = _discovery_manifest_path(model_root, run_name)
@@ -794,7 +1007,7 @@ def _table10(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     eap = _aggregate_eapig_neurons(manifest_path).head(int(top_n))
-    cha = _top_cha_neurons(_stats_dir(model_root, run_name), top_n=top_n)
+    cha = _top_cha_neurons(_resolve_stats_dir(model_root, run_name), top_n=top_n, rank_metric=cha_rank_metric)
 
     eap_counts = eap["layer"].value_counts().to_dict() if not eap.empty else {}
     cha_counts = cha["layer_label"].value_counts().to_dict() if not cha.empty else {}
@@ -809,17 +1022,21 @@ def _table10(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
             f"CHA top-{top_n}": f"{cc} ({round(100.0 * cc / max(len(cha), 1)):.0f}%)",
         })
     df = pd.DataFrame(rows)
-    _write_table_artifacts(df, out_dir, "table10_layer_concentration", caption=f"Table 10: Layer concentration among the top-{top_n} neurons selected by EAP-IG vs. CHA.")
+    _write_table_artifacts(df, out_dir, "table10_layer_concentration", caption=f"Table 10: Layer concentration among the top-{top_n} neurons selected by EAP-IG vs. CHA ranked by {cha_rank_metric} flip rate.")
     eap.to_csv(out_dir / "table10_eapig_top_neurons.csv", index=False)
     cha.to_csv(out_dir / "table10_cha_top_neurons.csv", index=False)
     return df
 
 
-def _table11(data_root: Path, out_dir: Path, task: str, model_spec: str, run_name: str, top_n: int) -> pd.DataFrame:
+def _table11(data_root: Path, out_dir: Path, task: str, model_spec: str, run_name: str, top_n: int, cha_rank_metric: str = "c2i") -> pd.DataFrame:
     model_root = _model_root_from_spec(data_root, task, model_spec)
-    manifest_path = _discovery_manifest_path(model_root, run_name)
+    try:
+        manifest_path = _discovery_manifest_path(model_root, run_name)
+    except FileNotFoundError as e:
+        print(f"[table11] skipped: {e}")
+        return pd.DataFrame()
     eap = _aggregate_eapig_neurons(manifest_path).head(int(top_n)).reset_index(drop=True)
-    cha = _top_cha_neurons(_stats_dir(model_root, run_name), top_n=top_n).reset_index(drop=True)
+    cha = _top_cha_neurons(_resolve_stats_dir(model_root, run_name), top_n=top_n, rank_metric=cha_rank_metric).reset_index(drop=True)
     rows = []
     for rank in range(int(top_n)):
         eap_row = eap.iloc[rank] if rank < len(eap) else None
@@ -831,7 +1048,7 @@ def _table11(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
             "CHA neuron": "" if cha_row is None else str(cha_row["neuron"]),
         })
     df = pd.DataFrame(rows)
-    _write_table_artifacts(df, out_dir, "table11_top10_eapig_vs_cha", caption="Table 11: Top-ranked neurons under EAP-IG attribution vs. CHA flip ranking.")
+    _write_table_artifacts(df, out_dir, "table11_top10_eapig_vs_cha", caption=f"Table 11: Top-ranked neurons under EAP-IG attribution vs. CHA {cha_rank_metric} flip ranking.")
     return df
 
 
@@ -840,7 +1057,7 @@ def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Dat
     for model_root in _find_model_roots(data_root):
         task, org, model = _task_org_model(data_root, model_root)
         for baseline_subset, baseline_label in [("positive_baseline", "pos"), ("negative_baseline", "neg")]:
-            loc_dir = _localization_dir(model_root, run_name, baseline_subset=baseline_subset)
+            loc_dir = _resolve_localization_dir(model_root, run_name, baseline_subset=baseline_subset)
             rk_path = loc_dir / "rule_knockout.json"
             if not rk_path.exists():
                 continue
@@ -886,8 +1103,8 @@ def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Dat
 def _table13(data_root: Path, out_dir: Path, task_a: str, task_b: str, model_spec: str, run_name: str, tau: float, baseline_subset: str) -> pd.DataFrame:
     root_a = _model_root_from_spec(data_root, task_a, model_spec)
     root_b = _model_root_from_spec(data_root, task_b, model_spec)
-    set_a = set(_load_agonist_map(_localization_dir(root_a, run_name, baseline_subset=baseline_subset), tau=tau).keys())
-    set_b = set(_load_agonist_map(_localization_dir(root_b, run_name, baseline_subset=baseline_subset), tau=tau).keys())
+    set_a = set(_load_agonist_map(_resolve_localization_dir(root_a, run_name, baseline_subset=baseline_subset), tau=tau).keys())
+    set_b = set(_load_agonist_map(_resolve_localization_dir(root_b, run_name, baseline_subset=baseline_subset), tau=tau).keys())
     inter = set_a & set_b
     union = set_a | set_b
     j = float(len(inter) / len(union)) if union else float("nan")
@@ -934,12 +1151,17 @@ def main():
     ap.add_argument("--table13_task_b", type=str, default="bon_jailbreaking")
     ap.add_argument("--table13_model", type=str, default="Qwen/Qwen2-7B-Instruct")
     ap.add_argument("--baseline_subset", type=str, default="positive_baseline", choices=["positive_baseline", "negative_baseline"])
+    ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage source: all rule-bearing localized neurons (paper default) or HQ-only coverage.")
+    ap.add_argument("--include_hans_in_main_tables", action="store_true", help="Include HANS/NLI in Tables 1-3/12 when matching compatible artifacts exist. The paper main tables omit HANS.")
+    ap.add_argument("--table3_scope", type=str, default="all", choices=["all", "selected"], help="Table 3 scope. 'all' reproduces the paper compact table; 'selected' honors --table3_task/--table3_model/--baseline_subset.")
+    ap.add_argument("--cha_rank_metric", type=str, default="c2i", choices=["c2i", "i2c", "flip_any"], help="Metric used to rank CHA neurons in Tables 10-11. The paper's Qwen2 arithmetic appendix uses c2i.")
     ap.add_argument("--notes_only", action="store_true", help="Only write a note about unsupported manual tables 4-8.")
     args = ap.parse_args()
 
     data_root = Path(args.data_root).resolve()
     out_root = Path(args.out_dir).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    main_table_tasks = None if args.include_hans_in_main_tables else DEFAULT_MAIN_TASKS
 
     if args.notes_only:
         note = (
@@ -963,17 +1185,17 @@ def main():
     results: Dict[str, Any] = {}
 
     if "table1" in which:
-        df = _table1(data_root, out_root)
+        df = _table1(data_root, out_root, tasks=main_table_tasks, coverage_source=args.table1_coverage_source)
         results["table1_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table1] no rows")
 
     if "table2" in which:
-        df, long_df = _table2(data_root, out_root, thresholds=thresholds)
+        df, long_df = _table2(data_root, out_root, thresholds=thresholds, tasks=main_table_tasks)
         results["table2_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table2] no rows")
 
     if "table3" in which:
-        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset)
+        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset, scope=args.table3_scope)
         results["table3_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table3] no rows")
 
@@ -983,12 +1205,12 @@ def main():
         print(df.to_string(index=False) if not df.empty else "[table9] no rows")
 
     if "table10" in which:
-        df = _table10(data_root, out_root, task=args.table10_task, model_spec=args.table10_model, run_name=MAIN_RUN, top_n=args.table10_topn)
+        df = _table10(data_root, out_root, task=args.table10_task, model_spec=args.table10_model, run_name=MAIN_RUN, top_n=args.table10_topn, cha_rank_metric=args.cha_rank_metric)
         results["table10_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table10] no rows")
 
     if "table11" in which:
-        df = _table11(data_root, out_root, task=args.table11_task, model_spec=args.table11_model, run_name=MAIN_RUN, top_n=args.table11_topn)
+        df = _table11(data_root, out_root, task=args.table11_task, model_spec=args.table11_model, run_name=MAIN_RUN, top_n=args.table11_topn, cha_rank_metric=args.cha_rank_metric)
         results["table11_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table11] no rows")
 
