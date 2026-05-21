@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Optional, but recommended so failures surface:
-# set -euo pipefail
+set -euo pipefail
 
 # Activate virtual environment
 source .env/bin/activate
@@ -27,8 +26,41 @@ DEFAULT_BATCH_SIZE=32
 DEFAULT_CIRCUIT_LEVEL=neuron
 DEFAULT_CIRCUIT_SIZE=100000
 DEFAULT_MIN_FLIP_RATE=0.2
-CIRCUIT_SIZE_LIST=(25000 200000) # run 200000 with DEFAULT_CIRCUIT_LEVEL=edge!
+CIRCUIT_SIZE_LIST=(25000 200000) # run 200000/85988 with DEFAULT_CIRCUIT_LEVEL=edge!
 MIN_FLIP_RATE_LIST=(0.3 0.4 0.5)
+
+SENSITIVITY_SUMMARY_ROOT="./paper_tables/sensitivity_summary"
+BASELINE_RUN_NAME="rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUMMARY_SCRIPT="$SCRIPT_DIR/11_summarize_sensitivity_analysis.py"
+
+if [ ! -f "$SUMMARY_SCRIPT" ]; then
+	echo "[error] Missing summary script: $SUMMARY_SCRIPT" >&2
+	exit 1
+fi
+
+summarize_sensitivity_analysis() {
+	local STATS_DIR="$1"
+	local EXPERIMENT="$2"
+	local ANALYZED_LLM="$3"
+	local SAFE_MODEL
+	local SUMMARY_OUT_DIR
+
+	if [ ! -d "$STATS_DIR" ]; then
+		echo "[error] Missing sensitivity-analysis stats directory: $STATS_DIR" >&2
+		exit 1
+	fi
+
+	SAFE_MODEL="$(printf '%s' "$ANALYZED_LLM" | sed 's#[/]#_#g')"
+	SUMMARY_OUT_DIR="$SENSITIVITY_SUMMARY_ROOT/$EXPERIMENT/$SAFE_MODEL"
+
+	echo "Summarizing sensitivity analysis for $ANALYZED_LLM on $EXPERIMENT: $STATS_DIR -> $SUMMARY_OUT_DIR"
+	python3 "$SUMMARY_SCRIPT" \
+		--stats_root "$STATS_DIR" \
+		--out_dir "$SUMMARY_OUT_DIR" \
+		--baseline_run_name "$BASELINE_RUN_NAME"
+}
 
 for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 	for EXPERIMENT in "${EXPERIMENT_LIST[@]}"; do
@@ -123,6 +155,9 @@ for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 			fi
 			run_setting "$DEFAULT_CIRCUIT_SIZE" "$MIN_FLIP_RATE"
 		done
+
+		# Run script 11 only for the task/model pair configured in this loop.
+		summarize_sensitivity_analysis "$STATS_DIR" "$EXPERIMENT" "$ANALYZED_LLM"
 
 	done
 done
