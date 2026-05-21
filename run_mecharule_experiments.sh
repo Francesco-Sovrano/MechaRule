@@ -8,9 +8,9 @@ source .env/bin/activate
 
 
 EXPERIMENT_LIST=(
-	# "hans_nli"
 	"arithmetic"
 	"bon_jailbreaking"
+	"hans_nli"
 )
 
 ANALYZED_LLM_LIST=(
@@ -70,7 +70,7 @@ for EXPERIMENT in "${EXPERIMENT_LIST[@]}"; do
 					Qwen/Qwen2-1.5B-Instruct)
 						;;
 					Qwen/*)
-						MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=3
+						# MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=3
 						BATCH_SIZE=256
 						;;
 					*)
