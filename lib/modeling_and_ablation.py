@@ -1,4 +1,3 @@
-import math
 import copy
 import re
 from collections import defaultdict
@@ -7,7 +6,6 @@ from scipy.spatial.distance import cdist
 import inspect, textwrap
 
 import json
-import gc
 import torch
 import transformer_lens as lens
 from contextlib import nullcontext

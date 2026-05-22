@@ -17,7 +17,6 @@ import copy
 import hashlib
 import pickle
 
-import scipy.stats
 
 # Local utils (expected to exist in your repo, as in the script you shared)
 from lib.modeling_and_ablation import (

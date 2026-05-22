@@ -22,13 +22,9 @@ import ollama
 import openai
 from groq import Groq
 
-import csv
-import random
-from collections import defaultdict
 
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
 
 def set_deterministic(seed=1337):
 	if seed is None:

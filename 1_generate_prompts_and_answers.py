@@ -5,15 +5,12 @@ import time
 import argparse
 import logging
 import json
-import pickle
 from pathlib import Path
 
 import torch
 import pandas as pd
-from more_itertools import unique_everseen  # unused here but fine
 
 from lib.caching_and_prompting import load_or_create_cache, create_cache
-from lib.modeling_and_ablation import LMWrapper, get_device
 from lib.feature_extraction_runner import resolve_task_spec
 
 #################################################################

@@ -9,25 +9,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # os.environ["EAP_LAYER_CHUNK"] = "8"
 
-import csv
 import re
 import json
-import math
 import random
 import argparse
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from tqdm import tqdm
-from typing import List, Dict, Tuple, Optional, Any
+from typing import Optional
 
 from functools import partial
 import numpy as np
 import pandas as pd
 import torch
 import gc
-import traceback
 
-from scipy.spatial.distance import cdist
 # from scipy.optimize import linear_sum_assignment
 from sentence_transformers import SentenceTransformer
 
@@ -35,8 +29,8 @@ from sentence_transformers import SentenceTransformer
 from lib.eap.graph import Graph
 from lib.eap.attribute import attribute  # for edges
 from lib.eap.attribute_node import attribute_node  # for neurons/nodes
-from lib.eap.data import PairItem, PairDataset, pair_by_length
-from lib.eap.metrics import compute_faithfulness_F, m_kl_span, m_nl_ratio_span, m_nl_ratio_span_both
+from lib.eap.data import PairItem, PairDataset
+from lib.eap.metrics import compute_faithfulness_F, m_kl_span
 
 # ---------------------- Local model loader ----------------------
 from lib.modeling_and_ablation import (

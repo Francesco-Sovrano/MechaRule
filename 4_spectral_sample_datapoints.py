@@ -20,7 +20,7 @@ from lib.text_and_rules import (
 	guess_filetype,
 	find_rule_files,
 )
-from lib.caching_and_prompting import load_or_create_cache, set_deterministic
+from lib.caching_and_prompting import set_deterministic
 from lib.spectral_analysis import (
     add_spectral_cli_args,
     build_reps_and_embedding_from_args,

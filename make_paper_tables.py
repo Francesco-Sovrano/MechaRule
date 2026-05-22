@@ -6,7 +6,6 @@ import ast
 import json
 import math
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 

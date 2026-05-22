@@ -15,14 +15,13 @@ import json
 import warnings
 
 import numba as nb
-from numba import njit, types, prange
+from numba import njit, prange
 from threadpoolctl import threadpool_limits
 
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import spearmanr
 from lib.ruleshap import RuleSHAP, rand_int
 from lib.caching_and_prompting import load_or_create_cache, create_cache
 import shap
-import re
 import torch
 
 @njit(inline='always', fastmath=True, nogil=True)

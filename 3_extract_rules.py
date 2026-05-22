@@ -6,14 +6,11 @@ import json
 import re
 
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
-import shap
 
-from lib.caching_and_prompting import load_or_create_cache, set_deterministic
+from lib.caching_and_prompting import set_deterministic
 from lib.data_model_for_shap import run_rule_extraction
 
-from lib.ruleshap import RuleSHAP
 from lib.feature_extraction_runner import resolve_task_spec
 from lib.feature_representation import safe_features_fillna
 

@@ -9,8 +9,7 @@ import json
 from more_itertools import unique_everseen
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier, RandomForestRegressor, RandomForestClassifier
-from sklearn.linear_model import LassoCV, Lasso, LogisticRegressionCV
+from sklearn.linear_model import LassoCV, Lasso
 from functools import reduce
 from tqdm import tqdm
 import math
@@ -21,25 +20,20 @@ from sklearn.base import TransformerMixin
 from sklearn.utils import check_array
 from sklearn.utils.validation import validate_data, _check_sample_weight
 from sklearn.linear_model import enet_path as _enet_path_base
-from sklearn.linear_model import lasso_path as _lasso_path_base
-from sklearn.linear_model._coordinate_descent import _pre_fit, _set_order, _alpha_grid, cd_fast
-from sklearn.utils.validation import check_random_state
+from sklearn.linear_model._coordinate_descent import _pre_fit, _set_order
 # from scipy import sparse
 
-from sklearn.metrics import matthews_corrcoef, mean_squared_error
-from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy import sparse
 
-from rulefit.rulefit import RuleFit, Winsorizer, FriedScale
+from rulefit.rulefit import Winsorizer, FriedScale
 
 from collections import defaultdict
 from xgboost import XGBRegressor, XGBClassifier
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 
-from numba import jit, njit
-from numba import int32, int64, float64, optional, types
+from numba import njit
+from numba import int32, float64, optional, types
 from numba.experimental import jitclass
-from numba.typed import List, Dict
+from numba.typed import List
 
 @njit
 def float_to_str(value, n_decimals=6):

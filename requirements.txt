@@ -4,7 +4,6 @@ more_itertools
 pandas
 tqdm
 tabulate
-scipy
 
 groq
 openai

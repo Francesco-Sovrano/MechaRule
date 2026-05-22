@@ -6,7 +6,6 @@ import re
 import gc
 import json
 import argparse
-import ast  # for parsing manifest neuron_label_score keys like "('m27', 277)"
 from pathlib import Path
 from collections import defaultdict
 
