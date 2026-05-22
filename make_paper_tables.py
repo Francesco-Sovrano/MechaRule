@@ -165,8 +165,6 @@ def _pretty_model(org: str, model: str) -> str:
     name = str(model)
     if name.startswith("Qwen2-"):
         core = name.replace("-Instruct", "")
-        if core == "Qwen2-7B":
-            return "Qwen2"
         return core
     if name.startswith("gpt-j") or name.startswith("GPT-J"):
         return "GPT-J"
@@ -434,6 +432,13 @@ def _write_table_artifacts(df: pd.DataFrame, out_dir: Path, stem: str, caption: 
     return {"csv": str(csv_path), "markdown": str(md_path), "latex": str(tex_path)}
 
 
+def _write_empty_table_artifacts(out_dir: Path, stem: str, columns: Sequence[str], caption: Optional[str] = None) -> pd.DataFrame:
+    """Overwrite outputs with an empty table so stale artifacts are not reused."""
+    df = pd.DataFrame(columns=list(columns))
+    _write_table_artifacts(df, out_dir, stem, caption=caption)
+    return df
+
+
 def _load_agonist_map(loc_dir: Path, tau: float) -> Dict[str, float]:
     buckets_path = loc_dir / "neuron_buckets.json"
     if not buckets_path.exists():
@@ -450,6 +455,50 @@ def _load_agonist_map(loc_dir: Path, tau: float) -> Dict[str, float]:
         if eff >= float(tau):
             out[str(key)] = eff
     return out
+
+
+def _baseline_subsets_for_table13(scope: str, fallback_baseline_subset: str) -> List[str]:
+    if scope == "both":
+        return ["positive_baseline", "negative_baseline"]
+    if scope == "positive":
+        return ["positive_baseline"]
+    if scope == "negative":
+        return ["negative_baseline"]
+    if scope == "selected":
+        return [fallback_baseline_subset]
+    raise ValueError(f"Unknown table13 baseline scope: {scope}")
+
+
+def _load_agonist_union_map_for_baselines(
+    model_root: Path,
+    run_name: str,
+    tau: float,
+    baseline_subsets: Sequence[str],
+) -> Tuple[Dict[str, float], List[str], List[str]]:
+    """Load a neuron-identity union over the requested baseline regimes.
+
+    Table 13 is a cross-task overlap table, not a same-circuit BF-vs-CHA
+    comparison.  It should therefore include all localized singleton agonists
+    from the requested baseline regimes and all circuits represented in each
+    bucket file.  If the same neuron appears in more than one baseline file, we
+    keep the largest effect for bin/threshold stability but count the neuron
+    once in the set.
+    """
+    out: Dict[str, float] = {}
+    present: List[str] = []
+    missing: List[str] = []
+    for baseline_subset in baseline_subsets:
+        loc_dir = _resolve_localization_dir(model_root, run_name, baseline_subset=baseline_subset)
+        buckets_path = loc_dir / "neuron_buckets.json"
+        if not buckets_path.exists():
+            missing.append(str(buckets_path))
+            continue
+        present.append(str(buckets_path))
+        current = _load_agonist_map(loc_dir, tau=tau)
+        for neuron, effect in current.items():
+            if effect > out.get(neuron, -float("inf")):
+                out[neuron] = effect
+    return out, present, missing
 
 
 def _iter_numeric_paths(obj: Any, prefix: Tuple[str, ...] = ()) -> Iterable[Tuple[Tuple[str, ...], float]]:
@@ -518,6 +567,44 @@ def _extract_flip_share_from_global(stats: Dict[str, Any], direction: str) -> fl
     return best_val
 
 
+def _directional_union_rate_from_hq_coverage(
+    hq: Dict[str, Any],
+    direction: str,
+    coverage_source: str,
+) -> float:
+    """Return Table 1's direction-specific union flip rate.
+
+    The numerator is a unique union over prompts, so a prompt flipped by several
+    neurons is counted once.  The denominator must be direction-specific:
+    1->0 is normalized by baseline-positive/correct examples, and 0->1 is
+    normalized by baseline-negative/incorrect examples.  This differs from the
+    legacy `flip_stats_global.json` rates, which are normalized by all evaluated
+    rows and therefore understate directional coverage when the baseline labels
+    are imbalanced.
+
+    With ``coverage_source="all"``, the numerator uses all localized
+    rule-bearing neurons.  With ``coverage_source="hq"``, it uses only neurons
+    that pass the high-quality rule threshold.
+    """
+    section_name = "flip_c2i" if direction == "c2i" else "flip_i2c"
+    section = hq.get(section_name) if isinstance(hq, dict) else None
+    if not isinstance(section, dict):
+        return float("nan")
+
+    rate_key = "eligible_union_rate_high" if coverage_source == "hq" else "eligible_union_rate_all"
+    rate = _safe_float(section.get(rate_key))
+    if rate == rate:
+        return rate
+
+    numerator_key = "union_high" if coverage_source == "hq" else "union_all"
+    numerator = _safe_float(section.get(numerator_key))
+    denominator = _safe_float(section.get("eligible_baseline_count"))
+    if numerator == numerator and denominator == denominator and denominator > 0:
+        return numerator / denominator
+
+    return float("nan")
+
+
 def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, coverage_source: str = "all") -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for model_root in _find_model_roots(data_root, tasks=tasks):
@@ -530,41 +617,56 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
         flip_global = _read_json(global_path) if global_path.exists() else {}
         task, org, model = _task_org_model(data_root, model_root)
 
-        if coverage_source == "hq":
-            c2i_share = _safe_float((hq.get("flip_c2i") or {}).get("union_share_of_all"))
-            i2c_share = _safe_float((hq.get("flip_i2c") or {}).get("union_share_of_all"))
-        else:
-            # Paper definition: union flip coverage over all rule-bearing localized neurons.
-            # Fall back to the HQ coverage file only when the all-neuron/global artifact is absent.
+        # Paper definition: direction-specific union flip coverage.  The
+        # denominator is the number of eligible source examples for the
+        # direction, not the total number of evaluated rows.  The HQ coverage
+        # artifact stores the required eligible denominators for both the
+        # all-neuron and HQ-only numerators.
+        c2i_share = _directional_union_rate_from_hq_coverage(hq, "c2i", coverage_source)
+        i2c_share = _directional_union_rate_from_hq_coverage(hq, "i2c", coverage_source)
+
+        if c2i_share != c2i_share:
             c2i_share = _extract_flip_share_from_global(flip_global, "c2i")
+            if c2i_share == c2i_share:
+                print(
+                    f"[table1] warning: {model_root} lacks direction-specific 1->0 "
+                    "coverage metadata; using legacy all-row denominator fallback."
+                )
+        if i2c_share != i2c_share:
             i2c_share = _extract_flip_share_from_global(flip_global, "i2c")
-            if c2i_share != c2i_share:
-                c2i_share = _safe_float((hq.get("flip_c2i") or {}).get("union_share_of_all"))
-            if i2c_share != i2c_share:
-                i2c_share = _safe_float((hq.get("flip_i2c") or {}).get("union_share_of_all"))
+            if i2c_share == i2c_share:
+                print(
+                    f"[table1] warning: {model_root} lacks direction-specific 0->1 "
+                    "coverage metadata; using legacy all-row denominator fallback."
+                )
 
         rows.append({
             "Task": _pretty_task(task),
             "Model": _pretty_model(org, model),
             "#HQ neurons": _safe_int(hq.get("n_neurons_high_quality")),
-            "flip ∪(1→0) (%)": round(100.0 * c2i_share, 1) if c2i_share == c2i_share else float("nan"),
-            "flip ∪(0→1) (%)": round(100.0 * i2c_share, 1) if i2c_share == i2c_share else float("nan"),
+            "∪(1→0) (elig. %)": round(100.0 * c2i_share, 1) if c2i_share == c2i_share else float("nan"),
+            "∪(0→1) (elig. %)": round(100.0 * i2c_share, 1) if i2c_share == i2c_share else float("nan"),
             "task_key": task,
             "model_key": model,
         })
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table1_main_high_quality_neurons",
+            ["Task", "Model", "#HQ neurons", "∪(1→0) (elig. %)", "∪(0→1) (elig. %)"],
+            caption="Table 1: End-to-end rule split + spectral coverage results."
+        )
     order_task = {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}
-    order_model = {"Qwen2": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
+    order_model = {"Qwen2-7B": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
     df["_ot"] = df["Task"].map(order_task).fillna(99)
     df["_om"] = df["Model"].map(order_model).fillna(99)
     df = df.sort_values(["_ot", "_om", "task_key", "model_key"]).drop(columns=["_ot", "_om", "task_key", "model_key"])
     caption = (
         "Table 1: End-to-end rule split + spectral coverage results. HQ neurons have held-out MCC >= 0.85; "
-        "union flip coverage includes all rule-bearing localized neurons."
+        "directional union flip coverage is normalized by eligible source examples and includes all rule-bearing localized neurons."
         if coverage_source != "hq"
-        else "Table 1: High-quality neuron-anchored rules and HQ-only flip coverage."
+        else "Table 1: High-quality neuron-anchored rules and HQ-only directional flip coverage, normalized by eligible source examples."
     )
     _write_table_artifacts(df, out_dir, "table1_main_high_quality_neurons", caption=caption)
     return df
@@ -838,6 +940,7 @@ def _table3(
     bins: Sequence[float],
     baseline_subset: str,
     scope: str = "all",
+    tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS,
 ) -> pd.DataFrame:
     if scope == "selected":
         records = _table3_collect_baseline_records(
@@ -848,9 +951,11 @@ def _table3(
             baseline_subsets=[baseline_subset],
         )
     else:
-        records = _table3_collect_baseline_records(data_root, bins=bins, tasks=DEFAULT_MAIN_TASKS)
+        records = _table3_collect_baseline_records(data_root, bins=bins, tasks=tasks)
 
     df = _table3_aggregate_records(records, bins=bins, include_per_model=True)
+    if df.empty:
+        df = pd.DataFrame(columns=["Task", "Model", "Baseline", "Overall", "#completed experiments"] + [label for _, _, label, _ in _table3_bin_specs(bins)])
     _write_table_artifacts(
         df,
         out_dir,
@@ -871,6 +976,7 @@ def _table3(
         "note_on_tau": "Table 3 is binned by --table3_bins; --tau is used by Table 13 and only affects Table 3 when bins are changed accordingly.",
         "bins": list(map(float, bins)),
         "scope": scope,
+        "tasks": None if tasks is None else list(tasks),
         "n_completed_baseline_records": int(len(records)),
         "records": [
             {
@@ -927,9 +1033,14 @@ def _table9(data_root: Path, out_dir: Path) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table9_baseline_performance",
+            ["Task", "Model", "Metric", "Value"],
+            caption="Table 9: Baseline performance of each model on its task dataset (unablated)."
+        )
     order_task = {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}
-    order_model = {"Qwen2": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
+    order_model = {"Qwen2-7B": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
     df["_ot"] = df["Task"].map(order_task).fillna(99)
     df["_om"] = df["Model"].map(order_model).fillna(99)
     df = df.sort_values(["_ot", "_om", "task_key", "model_key"]).drop(columns=["_ot", "_om", "task_key", "model_key"])
@@ -1003,7 +1114,12 @@ def _table10(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
         manifest_path = _discovery_manifest_path(model_root, run_name)
     except FileNotFoundError as e:
         print(f"[table10] skipped: {e}")
-        return pd.DataFrame()
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table10_layer_concentration",
+            ["Layer", f"EAP-IG top-{top_n}", f"CHA top-{top_n}"],
+            caption=f"Table 10: skipped because the EAP-IG manifest was missing."
+        )
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     eap = _aggregate_eapig_neurons(manifest_path).head(int(top_n))
@@ -1034,7 +1150,12 @@ def _table11(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
         manifest_path = _discovery_manifest_path(model_root, run_name)
     except FileNotFoundError as e:
         print(f"[table11] skipped: {e}")
-        return pd.DataFrame()
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table11_top10_eapig_vs_cha",
+            ["Rank", "EAP-IG neuron", "|IG|", "CHA neuron"],
+            caption="Table 11: skipped because the EAP-IG manifest was missing."
+        )
     eap = _aggregate_eapig_neurons(manifest_path).head(int(top_n)).reset_index(drop=True)
     cha = _top_cha_neurons(_resolve_stats_dir(model_root, run_name), top_n=top_n, rank_metric=cha_rank_metric).reset_index(drop=True)
     rows = []
@@ -1052,9 +1173,9 @@ def _table11(data_root: Path, out_dir: Path, task: str, model_spec: str, run_nam
     return df
 
 
-def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.DataFrame:
+def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for model_root in _find_model_roots(data_root):
+    for model_root in _find_model_roots(data_root, tasks=tasks):
         task, org, model = _task_org_model(data_root, model_root)
         for baseline_subset, baseline_label in [("positive_baseline", "pos"), ("negative_baseline", "neg")]:
             loc_dir = _resolve_localization_dir(model_root, run_name, baseline_subset=baseline_subset)
@@ -1088,9 +1209,14 @@ def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Dat
             })
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table12_cha_ablation_budget",
+            ["Task", "Model", "Baseline", "#rules", "n ablation_groups (by circuit id)", "Mean", "Median", "Min–Max"],
+            caption="Table 12: Number of ablation groups evaluated by CHA."
+        )
     order_task = {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}
-    order_model = {"Qwen2": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
+    order_model = {"Qwen2-7B": 0, "GPT-J": 1, "Qwen2-1.5B": 2}
     order_base = {"pos": 0, "neg": 1}
     df["_ot"] = df["Task"].map(order_task).fillna(99)
     df["_om"] = df["Model"].map(order_model).fillna(99)
@@ -1100,32 +1226,91 @@ def _table12(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN) -> pd.Dat
     return df
 
 
-def _table13(data_root: Path, out_dir: Path, task_a: str, task_b: str, model_spec: str, run_name: str, tau: float, baseline_subset: str) -> pd.DataFrame:
+def _table13(
+    data_root: Path,
+    out_dir: Path,
+    task_a: str,
+    task_b: str,
+    model_spec: str,
+    run_name: str,
+    tau: float,
+    baseline_subset: str,
+    baseline_scope: str = "both",
+) -> pd.DataFrame:
     root_a = _model_root_from_spec(data_root, task_a, model_spec)
     root_b = _model_root_from_spec(data_root, task_b, model_spec)
-    set_a = set(_load_agonist_map(_resolve_localization_dir(root_a, run_name, baseline_subset=baseline_subset), tau=tau).keys())
-    set_b = set(_load_agonist_map(_resolve_localization_dir(root_b, run_name, baseline_subset=baseline_subset), tau=tau).keys())
+    baseline_subsets = _baseline_subsets_for_table13(baseline_scope, baseline_subset)
+
+    map_a, present_a, missing_a = _load_agonist_union_map_for_baselines(root_a, run_name, tau=tau, baseline_subsets=baseline_subsets)
+    map_b, present_b, missing_b = _load_agonist_union_map_for_baselines(root_b, run_name, tau=tau, baseline_subsets=baseline_subsets)
+
+    if not present_a or not present_b:
+        missing = []
+        if not present_a:
+            missing.extend(missing_a)
+        if not present_b:
+            missing.extend(missing_b)
+        print("[table13] skipped: missing neuron_buckets.json artifacts for at least one task:\n" + "\n".join(missing))
+        meta = {
+            "task_a": task_a,
+            "task_b": task_b,
+            "model": model_spec,
+            "tau": float(tau),
+            "baseline_scope": baseline_scope,
+            "baseline_subsets": baseline_subsets,
+            "status": "skipped_missing_neuron_buckets",
+            "present_a": present_a,
+            "present_b": present_b,
+            "missing_a": missing_a,
+            "missing_b": missing_b,
+        }
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "table13_metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        (out_dir / "table13_intersection_neurons.txt").write_text("", encoding="utf-8")
+        return _write_empty_table_artifacts(
+            out_dir,
+            "table13_cross_task_overlap",
+            ["Setting", "|A|", "|J|", "|A ∩ J|", "Jaccard"],
+            caption="Table 13: Overlap between localized singleton τ-agonists across tasks."
+        )
+
+    set_a = set(map_a.keys())
+    set_b = set(map_b.keys())
     inter = set_a & set_b
     union = set_a | set_b
     j = float(len(inter) / len(union)) if union else float("nan")
     model_short = model_spec.split("/", 1)[1].replace("-Instruct", "")
+    baseline_label = "both baselines" if baseline_scope == "both" else (baseline_subsets[0].replace("_baseline", "") + " baseline")
     row = {
-        "Setting": f"{model_short}, spectral coverage, τ={tau}",
+        "Setting": f"{model_short}, spectral coverage, τ={tau}, {baseline_label}",
         "|A|": int(len(set_a)),
         "|J|": int(len(set_b)),
         "|A ∩ J|": int(len(inter)),
         "Jaccard": _fmt_num(j, nd=3),
     }
     df = pd.DataFrame([row])
-    _write_table_artifacts(df, out_dir, "table13_cross_task_overlap", caption="Table 13: Overlap between localized singleton τ-agonists across tasks.")
+    _write_table_artifacts(
+        df,
+        out_dir,
+        "table13_cross_task_overlap",
+        caption="Table 13: Overlap between localized singleton τ-agonists across tasks, using the union over the requested baseline regimes."
+    )
     (out_dir / "table13_intersection_neurons.txt").write_text(", ".join(sorted(inter)) + "\n", encoding="utf-8")
     meta = {
         "task_a": task_a,
         "task_b": task_b,
         "model": model_spec,
         "tau": float(tau),
-        "baseline_subset": baseline_subset,
+        "baseline_scope": baseline_scope,
+        "baseline_subsets": baseline_subsets,
+        "present_a": present_a,
+        "present_b": present_b,
+        "missing_a": missing_a,
+        "missing_b": missing_b,
+        "task_a_neurons": sorted(set_a),
+        "task_b_neurons": sorted(set_b),
         "intersection_neurons": sorted(inter),
+        "jaccard": j,
     }
     (out_dir / "table13_metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return df
@@ -1150,8 +1335,9 @@ def main():
     ap.add_argument("--table13_task_a", type=str, default="arithmetic")
     ap.add_argument("--table13_task_b", type=str, default="bon_jailbreaking")
     ap.add_argument("--table13_model", type=str, default="Qwen/Qwen2-7B-Instruct")
+    ap.add_argument("--table13_baseline_scope", type=str, default="both", choices=["both", "positive", "negative", "selected"], help="Baseline regimes used for Table 13 cross-task overlap. Default 'both' matches the paper's all-localized-neuron overlap; 'selected' uses --baseline_subset.")
     ap.add_argument("--baseline_subset", type=str, default="positive_baseline", choices=["positive_baseline", "negative_baseline"])
-    ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage source: all rule-bearing localized neurons (paper default) or HQ-only coverage.")
+    ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage numerator: all rule-bearing localized neurons (paper default) or HQ-only neurons. Directional rates are normalized by eligible source examples.")
     ap.add_argument("--include_hans_in_main_tables", action="store_true", help="Include HANS/NLI in Tables 1-3/12 when matching compatible artifacts exist. The paper main tables omit HANS.")
     ap.add_argument("--table3_scope", type=str, default="all", choices=["all", "selected"], help="Table 3 scope. 'all' reproduces the paper compact table; 'selected' honors --table3_task/--table3_model/--baseline_subset.")
     ap.add_argument("--cha_rank_metric", type=str, default="c2i", choices=["c2i", "i2c", "flip_any"], help="Metric used to rank CHA neurons in Tables 10-11. The paper's Qwen2 arithmetic appendix uses c2i.")
@@ -1195,7 +1381,7 @@ def main():
         print(df.to_string(index=False) if not df.empty else "[table2] no rows")
 
     if "table3" in which:
-        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset, scope=args.table3_scope)
+        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset, scope=args.table3_scope, tasks=main_table_tasks)
         results["table3_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table3] no rows")
 
@@ -1215,12 +1401,12 @@ def main():
         print(df.to_string(index=False) if not df.empty else "[table11] no rows")
 
     if "table12" in which:
-        df = _table12(data_root, out_root, run_name=MAIN_RUN)
+        df = _table12(data_root, out_root, run_name=MAIN_RUN, tasks=main_table_tasks)
         results["table12_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table12] no rows")
 
     if "table13" in which:
-        df = _table13(data_root, out_root, task_a=args.table13_task_a, task_b=args.table13_task_b, model_spec=args.table13_model, run_name=MAIN_RUN, tau=args.tau, baseline_subset=args.baseline_subset)
+        df = _table13(data_root, out_root, task_a=args.table13_task_a, task_b=args.table13_task_b, model_spec=args.table13_model, run_name=MAIN_RUN, tau=args.tau, baseline_subset=args.baseline_subset, baseline_scope=args.table13_baseline_scope)
         results["table13_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table13] no rows")
 
