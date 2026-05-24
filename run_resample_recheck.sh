@@ -7,7 +7,7 @@ source .env/bin/activate
 # Recheck scripts 6 and 7 with the SAME effective config used by
 # _run_pipeline.sh / run_mecharule_experiments.sh for:
 #   arithmetic + Qwen/Qwen2-7B-Instruct + spectral discovery + spectral anchoring plan
-# while changing only the intervention from the pipeline's effective `mean`
+# while changing only the intervention from the pipeline's effective `mean-positional`
 # to `mean-donor`.
 
 # Run from the directory that contains this script, so all relative paths are project-local.
@@ -38,7 +38,7 @@ DISCOVERY_OUT_DIR="${DATA_DIR}/neural_circuit_discovery_results/eap_ig_inputs/${
 DISCOVERY_INPUT_AUTODISCOVERY_DIR="${DISCOVERY_OUT_DIR}/neural_circuits"
 
 # Baseline labels as produced by _run_pipeline.sh.
-BASELINE_INTERVENTION="mean"
+BASELINE_INTERVENTION="mean-positional"
 BASELINE_BAG_LABEL="agonist_neurons-fast-spectral_anchor"
 BASELINE_STATS_DIRNAME="${CIRCUIT_LABEL}-${BASELINE_BAG_LABEL}"
 BASELINE_STATS_DIR="${RULES_DIR}/neuron_flip_rules/stats/${BASELINE_STATS_DIRNAME}"
