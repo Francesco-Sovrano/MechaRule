@@ -13,13 +13,20 @@ Francesco Sovrano, Gabriele Dominici, and Marc Langheinrich
 Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining, KDD 2026  
 DOI: `10.1145/3770855.3818091`
 
+## Related repositories
+
+This repository uses RuleSHAP-style rule extraction in `lib/ruleshap.py` and `lib/data_model_for_shap.py`. For the standalone RuleSHAP project, documentation, and reusable rule-extraction code, see:
+
+- RuleSHAP: https://github.com/Francesco-Sovrano/RuleSHAP
+
 ## What the pipeline does
 
-MechaRule has three main stages:
+MechaRule has four main stages:
 
-1. **Behaviour measurement**: generate or load prompts, run an analysed LLM, and score task-level behaviour such as arithmetic correctness, jailbreak success, or NLI correctness.
-2. **Symbolic rule extraction**: generate interpretable feature functions, score each datapoint, and extract rules that predict the target behaviour.
-3. **Neuron anchoring**: use circuit attribution, grouped ablations, and neuron-level refinement to identify neurons whose suppression selectively disrupts the rule-aligned behaviour.
+1. **Behaviour measurement and behavioural rule extraction**: generate or load prompts, run an analysed LLM, score task-level behaviour such as arithmetic correctness, jailbreak success, or NLI correctness, generate interpretable feature functions, and extract symbolic splitter rules that predict the target behaviour.
+2. **Search-space reduction**: compress the rule-induced datapoint slices with spectral coverage, build matched or otherwise controlled evaluation subsets, and use EAP or EAP-IG attribution to shortlist candidate model components.
+3. **Causal localization with Contrastive Hierarchical Ablation (CHA)**: run grouped and then fine-grained ablations over the retained candidates to identify high-effect agonist coordinates whose interventions flip the behaviour in a fixed baseline regime.
+4. **Neuron-anchored rule extraction**: for each localized singleton candidate, fit a flip-predictive symbolic rule that describes when ablating that coordinate matters on held-out inputs.
 
 The pipeline is designed for auditing learned behaviours in open-weight LLMs. Some steps can use hosted APIs for feature generation or judging, but the circuit-discovery and ablation stages require local model access.
 
@@ -62,7 +69,7 @@ The pipeline is designed for auditing learned behaviours in open-weight LLMs. So
 | `lib/caching_and_prompting.py` | Caching, deterministic seeding, and unified model-call wrappers for Ollama, OpenAI, and Groq. |
 | `lib/feature_representation.py` | Feature dataclass plus sandboxed execution of LLM-proposed feature functions. |
 | `lib/feature_extraction_runner.py` | Feature proposal, scoring, filtering, and report generation. |
-| `lib/ruleshap.py` and `lib/data_model_for_shap.py` | RuleSHAP-style rule extraction and orchestration. |
+| `lib/ruleshap.py` and `lib/data_model_for_shap.py` | RuleSHAP-style rule extraction and orchestration. The standalone RuleSHAP repository is https://github.com/Francesco-Sovrano/RuleSHAP. |
 | `lib/text_and_rules.py` | Rule loading, parsing, and application to feature tables. |
 | `lib/spectral_analysis.py` | LLM representation extraction, PCA, spectral coverage, and sampling utilities. |
 | `lib/modeling_and_ablation.py` | Hugging Face and TransformerLens model loading, generation, and ablation hooks. |
