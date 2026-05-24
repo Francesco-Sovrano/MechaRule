@@ -67,6 +67,23 @@ SENSITIVITY_ARTIFACT_PATTERNS = (
     re.compile(r"-tau0\.\d"),
 )
 
+# Fallback architecture sizes used only when result artifacts do not expose
+# the brute-force candidate count N directly.  The budget denominator is
+# 2*N - 1, where N is the matched brute-force singleton candidate count.
+# The script first tries to read N from artifacts, then combines the observed
+# hidden width with these layer counts, and finally falls back to these
+# complete tuples.  The cap limits N for larger sampled brute-force runs.
+MODEL_ARCHITECTURE_FALLBACKS = {
+    "gpt-j-6B": {"n_layers": 28, "hidden_size": 4096},
+    "GPT-J": {"n_layers": 28, "hidden_size": 4096},
+    "Qwen2-7B-Instruct": {"n_layers": 28, "hidden_size": 3584},
+    "Qwen2-7B": {"n_layers": 28, "hidden_size": 3584},
+    "Qwen2-1.5B-Instruct": {"n_layers": 28, "hidden_size": 1536},
+    "Qwen2-1.5B": {"n_layers": 28, "hidden_size": 1536},
+}
+
+DEFAULT_BRUTEFORCE_CANDIDATE_CAP = 100000
+
 
 def _is_sensitivity_artifact_path(path: Path) -> bool:
     """Return True when any path component looks like a sensitivity artefact."""
@@ -424,7 +441,7 @@ def _write_table_artifacts(df: pd.DataFrame, out_dir: Path, stem: str, caption: 
     except ImportError:
         md_text = _markdown_fallback(df, index=index)
     md_path.write_text(md_text + "\n", encoding="utf-8")
-    tex = df.to_latex(index=index, escape=False)
+    tex = df.to_latex(index=index, escape=True)
     if caption:
         tex = f"% {caption}\n" + tex
     tex_path.write_text(tex + "\n", encoding="utf-8")
@@ -639,10 +656,14 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
                     "coverage metadata; using legacy all-row denominator fallback."
                 )
 
+        n_loc = _safe_int(hq.get("n_neurons_total"))
+        if n_loc is None:
+            n_loc = _safe_int(flip_global.get("n_neurons"))
         rows.append({
             "Task": _pretty_task(task),
             "Model": _pretty_model(org, model),
-            "#HQ neurons": _safe_int(hq.get("n_neurons_high_quality")),
+            "# Loc.": n_loc,
+            "HQ": _safe_int(hq.get("n_neurons_high_quality")),
             "∪(1→0) (elig. %)": round(100.0 * c2i_share, 1) if c2i_share == c2i_share else float("nan"),
             "∪(0→1) (elig. %)": round(100.0 * i2c_share, 1) if i2c_share == i2c_share else float("nan"),
             "task_key": task,
@@ -653,7 +674,7 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
         return _write_empty_table_artifacts(
             out_dir,
             "table1_main_high_quality_neurons",
-            ["Task", "Model", "#HQ neurons", "∪(1→0) (elig. %)", "∪(0→1) (elig. %)"],
+            ["Task", "Model", "# Loc.", "HQ", "∪(1→0) (elig. %)", "∪(0→1) (elig. %)"],
             caption="Table 1: End-to-end rule split + spectral coverage results."
         )
     order_task = {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}
@@ -662,8 +683,9 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
     df["_om"] = df["Model"].map(order_model).fillna(99)
     df = df.sort_values(["_ot", "_om", "task_key", "model_key"]).drop(columns=["_ot", "_om", "task_key", "model_key"])
     caption = (
-        "Table 1: End-to-end rule split + spectral coverage results. HQ neurons have held-out MCC >= 0.85; "
-        "directional union flip coverage is normalized by eligible source examples and includes all rule-bearing localized neurons."
+        "Table 1: End-to-end rule split + spectral coverage results. # Loc. counts all rule-bearing localized neurons; "
+        "HQ counts those with held-out MCC >= 0.85; directional union flip coverage is normalized by eligible source examples "
+        "and includes all rule-bearing localized neurons."
         if coverage_source != "hq"
         else "Table 1: High-quality neuron-anchored rules and HQ-only directional flip coverage, normalized by eligible source examples."
     )
@@ -679,10 +701,18 @@ def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_nam
         for run_name in run_names:
             stats_dir = _resolve_stats_dir(model_root, run_name)
             csv_path = stats_dir / "rule_combo_metrics_best_per_neuron.csv"
-            if not csv_path.exists():
-                continue
-            df = pd.read_csv(csv_path, low_memory=False)
-            mcc = pd.to_numeric(df.get("MCC"), errors="coerce")
+            if csv_path.exists():
+                df = pd.read_csv(csv_path, low_memory=False)
+                mcc = pd.to_numeric(df.get("MCC"), errors="coerce")
+                n_rule_bearing = int(mcc.notna().sum())
+            else:
+                # A completed run can legitimately produce no localized neurons.
+                # In that case downstream anchoring writes no per-neuron CSV, but
+                # Table 2 must still count the configured task/model/run as zero
+                # rather than dropping it from the denominator. This is especially
+                # common for fake-target controls.
+                mcc = pd.Series(dtype=float)
+                n_rule_bearing = 0
             for t in thresholds:
                 per_run_rows.append({
                     "task": task,
@@ -691,7 +721,8 @@ def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_nam
                     "run_name": run_name,
                     "Method": RUN_CONFIGS[run_name]["display"],
                     "threshold": float(t),
-                    "n_high_quality_neurons": int((mcc >= float(t)).sum()),
+                    "n_rule_bearing_neurons": n_rule_bearing,
+                    "n_high_quality_neurons": int((mcc >= float(t)).sum()) if not mcc.empty else 0,
                 })
     per_run_df = pd.DataFrame(per_run_rows)
     if per_run_df.empty:
@@ -705,6 +736,22 @@ def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_nam
         wide_rows.append(row)
     wide_df = pd.DataFrame(wide_rows)
     _write_table_artifacts(wide_df, out_dir, "table2_threshold_sweep_totals", caption="Table 2: Total number of high-quality neurons (MCC ≥ t) summed over all available task/model runs.")
+
+    # Also write a threshold-independent yield table. This is the number of
+    # rule-bearing localized neurons with a learned anchor attempt, i.e. the row
+    # count of rule_combo_metrics_best_per_neuron.csv. It must not be confused
+    # with n_high_quality_neurons, which applies an MCC threshold.
+    yield_rows = []
+    for method in [RUN_CONFIGS[r]["display"] for r in run_names]:
+        sub = per_run_df[per_run_df["Method"] == method]
+        if sub.empty:
+            yield_rows.append({"Method": method, "# rule-bearing localized neurons": 0})
+        else:
+            per_unit = sub.drop_duplicates(["task", "org", "model", "run_name"])
+            yield_rows.append({"Method": method, "# rule-bearing localized neurons": int(per_unit["n_rule_bearing_neurons"].sum())})
+    yield_df = pd.DataFrame(yield_rows)
+    _write_table_artifacts(yield_df, out_dir, "table2_rule_bearing_yield_totals", caption="Threshold-independent number of rule-bearing localized neurons summed over all available task/model runs.")
+
     per_run_df.to_csv(out_dir / "table2_threshold_sweep_per_run_long.csv", index=False)
     return wide_df, per_run_df
 
@@ -819,7 +866,320 @@ def _compact_recall_cell(recovered: int, total: int) -> str:
     return f"{int(recovered)}/{int(total)} ({100.0 * float(recovered) / float(total):.1f}%)"
 
 
-def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float], tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, model_spec: Optional[str] = None, baseline_subsets: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+def _parse_recall_cell(cell: Any) -> Tuple[int, int]:
+    """Parse cells such as '120/160 (75.0%)' or '120/160'."""
+    m = re.search(r"(\d+)\s*/\s*(\d+)", str(cell))
+    if not m:
+        return 0, 0
+    return int(m.group(1)), int(m.group(2))
+
+
+def _compact_budget_cell(numer: int, denom: int) -> str:
+    if denom <= 0:
+        return ""
+    return f"{100.0 * float(numer) / float(denom):.2f}%"
+
+
+def _parse_ablation_group_parts(value: Any) -> int:
+    """Sum '0:2864,1:281' style group-count summaries."""
+    total = 0
+    for part in str(value).split(','):
+        if ':' in part:
+            part = part.split(':', 1)[1]
+        n = _safe_int(str(part).strip(), default=0)
+        total += n
+    return int(total)
+
+
+def _cha_ablation_count_from_rule_knockout(
+    model_root: Path,
+    run_name: str,
+    baseline_subset: str,
+) -> Tuple[int, List[str], str]:
+    """Return total CHA group ablations for a model/regime."""
+    loc_dir = _resolve_localization_dir(model_root, run_name, baseline_subset=baseline_subset)
+    rk_path = loc_dir / "rule_knockout.json"
+    if not rk_path.exists():
+        return 0, [], str(rk_path)
+    rk = _read_json(rk_path)
+    if not isinstance(rk, list):
+        return 0, [], str(rk_path)
+    counts: List[int] = []
+    parts: List[str] = []
+    for i, rec in enumerate(rk):
+        if not isinstance(rec, dict) or rec.get("status") != "ok":
+            continue
+        cid = _safe_int(rec.get("circuit_id"), i)
+        n = _safe_int(rec.get("n_ablation_groups"), 0)
+        counts.append(n)
+        parts.append(f"{cid}:{n}")
+    return int(sum(counts)), parts, str(rk_path)
+
+
+def _architecture_fallback_for_model(model: str) -> Dict[str, int]:
+    name = str(model).replace("-Instruct", "")
+    candidates = [str(model), name]
+    for cand in candidates:
+        if cand in MODEL_ARCHITECTURE_FALLBACKS:
+            return dict(MODEL_ARCHITECTURE_FALLBACKS[cand])
+    for key, value in MODEL_ARCHITECTURE_FALLBACKS.items():
+        if key in str(model) or str(model) in key:
+            return dict(value)
+    return {}
+
+
+def _observed_hidden_width_from_bf_stats(model_root: Path, baseline_subset: str) -> Optional[int]:
+    """Infer per-layer singleton width from BF statistics when present."""
+    stats_dir = _resolve_stats_dir(model_root, BF_RUN)
+    csv_candidates = [
+        stats_dir / "agonist_metric_delta_by_unit.csv",
+        stats_dir / "agonist_metric_summary.csv",
+    ]
+    wanted_source = baseline_subset.replace("_baseline", "")
+    for path in csv_candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path, low_memory=False)
+        except Exception:
+            continue
+        cols = [c for c in df.columns if c.startswith("n_compared_activations")]
+        if not cols:
+            continue
+        sub = df
+        if "source_parent" in df.columns:
+            mask = df["source_parent"].astype(str).str.contains(baseline_subset, regex=False)
+            if mask.any():
+                sub = df[mask]
+            else:
+                # Older summary paths contain only positive/negative in the path.
+                mask = df["source_parent"].astype(str).str.contains(wanted_source, regex=False)
+                if mask.any():
+                    sub = df[mask]
+        values = []
+        for col in cols:
+            values.extend(pd.to_numeric(sub[col], errors="coerce").dropna().astype(float).tolist())
+        values = [int(v) for v in values if math.isfinite(v) and v > 0]
+        if values:
+            return int(max(values))
+    return None
+
+
+def _direct_bruteforce_candidate_count_from_artifacts(model_root: Path, baseline_subset: str) -> Tuple[int, str]:
+    """Try to read the matched BF singleton candidate count N from artifacts."""
+    loc_dir = _resolve_localization_dir(model_root, BF_RUN, baseline_subset=baseline_subset)
+    stats_dir = _resolve_stats_dir(model_root, BF_RUN)
+    candidate_paths = []
+    for base in [loc_dir, stats_dir]:
+        candidate_paths.extend([
+            base / "ablation_budget.json",
+            base / "budget.json",
+            base / "run_summary.json",
+            base / "metadata.json",
+            base / "agonist_metric_stats.json",
+        ])
+    keys = [
+        "n_bruteforce_candidates",
+        "n_bruteforce_singleton_candidates",
+        "n_singleton_candidates",
+        "n_ablation_units",
+        "n_candidate_units",
+        "n_compared_units_total",
+        "n_total_units",
+    ]
+    for path in _unique_preserve_order(candidate_paths):
+        if not path.exists():
+            continue
+        try:
+            obj = _read_json(path)
+        except Exception:
+            continue
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for key in keys:
+                    if key in cur:
+                        val = _safe_int(cur.get(key), 0)
+                        if val > 0:
+                            return val, f"artifact:{path}:{key}"
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+    return 0, ""
+
+
+def _bruteforce_ablation_count(
+    model_root: Path,
+    baseline_subset: str,
+    brute_force_candidate_cap: int = DEFAULT_BRUTEFORCE_CANDIDATE_CAP,
+) -> Tuple[int, str]:
+    """Return matched brute-force ablation denominator, 2*N - 1.
+
+    N is the matched brute-force singleton candidate count.  The preferred
+    source is an explicit artifact field for N.  When absent, N is inferred
+    from n_layers * hidden_width, capped for larger sampled brute-force runs.
+    The returned denominator is always 2*N - 1.
+    """
+    n_candidates, source = _direct_bruteforce_candidate_count_from_artifacts(model_root, baseline_subset)
+
+    if n_candidates <= 0:
+        try:
+            _, _, model = _task_org_model(model_root.parent.parent.parent, model_root)
+        except Exception:
+            model = model_root.name
+        arch = _architecture_fallback_for_model(model)
+        width = _observed_hidden_width_from_bf_stats(model_root, baseline_subset) or arch.get("hidden_size")
+        n_layers = arch.get("n_layers")
+        if width and n_layers:
+            raw = int(width) * int(n_layers)
+            if brute_force_candidate_cap and raw > int(brute_force_candidate_cap):
+                n_candidates = int(brute_force_candidate_cap)
+                source = f"architecture_fallback_candidates:min({raw},{int(brute_force_candidate_cap)})"
+            else:
+                n_candidates = int(raw)
+                source = f"architecture_fallback_candidates:{int(n_layers)}x{int(width)}"
+
+    if n_candidates > 0:
+        denom = 2 * int(n_candidates) - 1
+        return int(denom), f"2N-1 from {source}; N={int(n_candidates)}"
+    return 0, "missing"
+
+
+def _find_model_root_by_pretty(data_root: Path, task_pretty: str, model_pretty: str) -> Optional[Path]:
+    for model_root in _find_model_roots(data_root, tasks=None):
+        task, org, model = _task_org_model(data_root, model_root)
+        if _pretty_task(task) == str(task_pretty) and _pretty_model(org, model) == str(model_pretty):
+            return model_root
+    return None
+
+
+def _find_precomputed_table_file(
+    data_root: Path,
+    out_dir: Path,
+    filename: str,
+    paper_tables_root: Optional[Path] = None,
+) -> Optional[Path]:
+    roots: List[Path] = []
+    if paper_tables_root is not None:
+        roots.append(Path(paper_tables_root))
+    roots.extend([out_dir, data_root])
+    roots.extend(list(data_root.resolve().parents)[:4])
+    roots.append(Path.cwd())
+    for root in _unique_preserve_order([r.resolve() for r in roots if r is not None]):
+        direct = [root / filename, root / "paper_tables" / filename]
+        for path in direct:
+            if path.exists():
+                return path
+        try:
+            hits = sorted(root.rglob(filename))
+        except Exception:
+            hits = []
+        if hits:
+            # Prefer non-metadata MacOS copies and paths that look like paper_tables.
+            hits = [h for h in hits if "__MACOSX" not in h.parts]
+            hits = sorted(hits, key=lambda h: ("paper_tables" not in h.parts, len(h.parts), str(h)))
+            if hits:
+                return hits[0]
+    return None
+
+
+def _precomputed_cha_count_lookup(table12_path: Optional[Path]) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    lookup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    if table12_path is None or not table12_path.exists():
+        return lookup
+    df = pd.read_csv(table12_path)
+    for _, row in df.iterrows():
+        baseline = str(row.get("Baseline", "")).strip()
+        baseline = {"pos": "positive", "neg": "negative"}.get(baseline, baseline)
+        parts_col = "n ablation_groups (by circuit id)"
+        total = 0
+        if "Total" in df.columns:
+            total = _safe_int(row.get("Total"), 0)
+        if total <= 0 and parts_col in df.columns:
+            total = _parse_ablation_group_parts(row.get(parts_col, ""))
+        key = (str(row.get("Task", "")), str(row.get("Model", "")), baseline)
+        lookup[key] = {
+            "cha_ablation_count": int(total),
+            "cha_ablation_parts": str(row.get(parts_col, "")),
+            "cha_ablation_source": str(table12_path),
+        }
+    return lookup
+
+
+def _collect_table3_records_from_precomputed(
+    data_root: Path,
+    out_dir: Path,
+    bins: Sequence[float],
+    paper_tables_root: Optional[Path] = None,
+    brute_force_candidate_cap: int = DEFAULT_BRUTEFORCE_CANDIDATE_CAP,
+) -> List[Dict[str, Any]]:
+    table3_path = _find_precomputed_table_file(data_root, out_dir, "table3_compact_bf_vs_cha.csv", paper_tables_root)
+    table12_path = _find_precomputed_table_file(data_root, out_dir, "table12_cha_ablation_budget.csv", paper_tables_root)
+    if table3_path is None or not table3_path.exists():
+        return []
+    df = pd.read_csv(table3_path)
+    cha_lookup = _precomputed_cha_count_lookup(table12_path)
+    specs = _table3_bin_specs(bins)
+    records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        baseline = str(row.get("Baseline", ""))
+        if baseline not in {"positive", "negative"}:
+            continue
+        task_pretty = str(row.get("Task", ""))
+        model_pretty = str(row.get("Model", ""))
+        if task_pretty == "All" or model_pretty == "All":
+            continue
+        recovered, total = _parse_recall_cell(row.get("Overall", ""))
+        bin_counts = {}
+        for _, _, label, _ in specs:
+            r, t = _parse_recall_cell(row.get(label, ""))
+            bin_counts[label] = {"recovered": int(r), "bf": int(t)}
+        key = (task_pretty, model_pretty, baseline)
+        cha_info = cha_lookup.get(key, {})
+        baseline_subset = "positive_baseline" if baseline == "positive" else "negative_baseline"
+        model_root = _find_model_root_by_pretty(data_root, task_pretty, model_pretty)
+        bf_count = 0
+        bf_source = ""
+        task_key = task_pretty
+        org = ""
+        model_key = model_pretty
+        if model_root is not None:
+            task_key, org, model_key = _task_org_model(data_root, model_root)
+            bf_count, bf_source = _bruteforce_ablation_count(model_root, baseline_subset, brute_force_candidate_cap=brute_force_candidate_cap)
+        else:
+            # arch = _architecture_fallback_for_model(model_pretty)
+            # if arch.get("n_layers") and arch.get("hidden_size"):
+            #     raw = int(arch["n_layers"]) * int(arch["hidden_size"])
+            #     n_candidates = min(raw, int(brute_force_candidate_cap)) if brute_force_candidate_cap else raw
+            #     bf_count = 2 * int(n_candidates) - 1
+            #     bf_source = f"2N-1 from architecture_fallback_candidates:{raw}; N={int(n_candidates)}"
+            raise ValueError("Missing bruteforce_ablation_count")
+        records.append({
+            "task": task_key,
+            "org": org,
+            "model": model_key,
+            "Task": task_pretty,
+            "Model": model_pretty,
+            "Baseline": baseline,
+            "overall_bf": int(total),
+            "overall_recovered": int(recovered),
+            "bin_counts": bin_counts,
+            "bf_dir": "",
+            "cha_dir": "",
+            "comparison_circuit_ids": [],
+            "cha_ablation_count": int(cha_info.get("cha_ablation_count", 0)),
+            "cha_ablation_parts": cha_info.get("cha_ablation_parts", ""),
+            "cha_ablation_source": cha_info.get("cha_ablation_source", ""),
+            "bf_ablation_count": int(bf_count),
+            "bf_ablation_source": bf_source,
+            "precomputed_table3_source": str(table3_path),
+            "precomputed_table12_source": "" if table12_path is None else str(table12_path),
+        })
+    return records
+
+
+def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float], tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, model_spec: Optional[str] = None, baseline_subsets: Optional[Sequence[str]] = None, brute_force_candidate_cap: int = DEFAULT_BRUTEFORCE_CANDIDATE_CAP) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     min_effect = float(min(bins[:-1])) if len(bins) > 1 else float(min(bins))
     baseline_map_all = {
@@ -852,6 +1212,12 @@ def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float], tas
             bf = _load_effect_map_from_buckets(bf_dir, min_effect=min_effect)
             cha = _load_effect_map_from_buckets(cha_dir, min_effect=min_effect, circuit_ids=bf_circuit_ids)
             counts = _count_bf_vs_cha_by_bins(bf, cha, bins=bins)
+            cha_count, cha_parts, cha_source = _cha_ablation_count_from_rule_knockout(
+                model_root, MAIN_RUN, baseline_subset=baseline_subset
+            )
+            bf_count, bf_source = _bruteforce_ablation_count(
+                model_root, baseline_subset=baseline_subset, brute_force_candidate_cap=brute_force_candidate_cap
+            )
             records.append({
                 "task": task,
                 "org": org,
@@ -865,6 +1231,11 @@ def _table3_collect_baseline_records(data_root: Path, bins: Sequence[float], tas
                 "bf_dir": str(bf_dir),
                 "cha_dir": str(cha_dir),
                 "comparison_circuit_ids": bf_circuit_ids,
+                "cha_ablation_count": int(cha_count),
+                "cha_ablation_parts": ",".join(cha_parts),
+                "cha_ablation_source": cha_source,
+                "bf_ablation_count": int(bf_count),
+                "bf_ablation_source": bf_source,
             })
     return records
 
@@ -893,11 +1264,15 @@ def _table3_aggregate_records(records: Sequence[Dict[str, Any]], bins: Sequence[
                 "#completed experiments": 0,
                 "overall_bf": 0,
                 "overall_recovered": 0,
+                "cha_ablation_count": 0,
+                "bf_ablation_count": 0,
                 "bin_counts": {label: {"bf": 0, "recovered": 0} for _, _, label, _ in specs},
             })
             bucket["#completed experiments"] += 1
             bucket["overall_bf"] += int(rec["overall_bf"])
             bucket["overall_recovered"] += int(rec["overall_recovered"])
+            bucket["cha_ablation_count"] += int(rec.get("cha_ablation_count", 0))
+            bucket["bf_ablation_count"] += int(rec.get("bf_ablation_count", 0))
             for _, _, label, _ in specs:
                 bucket["bin_counts"][label]["bf"] += int((rec["bin_counts"].get(label) or {}).get("bf", 0))
                 bucket["bin_counts"][label]["recovered"] += int((rec["bin_counts"].get(label) or {}).get("recovered", 0))
@@ -907,6 +1282,9 @@ def _table3_aggregate_records(records: Sequence[Dict[str, Any]], bins: Sequence[
                 "Task": bucket["Task"],
                 "Model": bucket["Model"],
                 "Baseline": bucket["Baseline"],
+                "Budget": _compact_budget_cell(bucket["cha_ablation_count"], bucket["bf_ablation_count"]),
+                "CHA ablations": int(bucket["cha_ablation_count"]),
+                "BF ablations": int(bucket["bf_ablation_count"]),
                 "Overall": _compact_recall_cell(bucket["overall_recovered"], bucket["overall_bf"]),
                 "#completed experiments": int(bucket["#completed experiments"]),
             }
@@ -930,6 +1308,58 @@ def _table3_aggregate_records(records: Sequence[Dict[str, Any]], bins: Sequence[
     return df
 
 
+def _table3_e2_from_records(records: Sequence[Dict[str, Any]], bins: Sequence[float]) -> pd.DataFrame:
+    specs = _table3_bin_specs(bins)
+    rows: List[Dict[str, Any]] = []
+    sorted_records = sorted(
+        records,
+        key=lambda r: (
+            {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}.get(str(r.get("Task")), 50),
+            {"Qwen2-7B": 0, "GPT-J": 1, "Qwen2-1.5B": 2}.get(str(r.get("Model")), 50),
+            {"positive": 0, "negative": 1}.get(str(r.get("Baseline")), 50),
+            str(r.get("Task")),
+            str(r.get("Model")),
+        ),
+    )
+    total_recovered = total_bf = total_cha_ab = total_bf_ab = 0
+    total_bins = {label: {"recovered": 0, "bf": 0} for _, _, label, _ in specs}
+    for rec in sorted_records:
+        b = str(rec.get("Baseline", ""))
+        if b not in {"positive", "negative"}:
+            continue
+        cha_ab = int(rec.get("cha_ablation_count", 0))
+        bf_ab = int(rec.get("bf_ablation_count", 0))
+        total_cha_ab += cha_ab
+        total_bf_ab += bf_ab
+        total_recovered += int(rec.get("overall_recovered", 0))
+        total_bf += int(rec.get("overall_bf", 0))
+        row = {
+            "Task/model": f"{str(rec.get('Task'))[:5] + '.' if str(rec.get('Task')) == 'Arithmetic' else 'Jail.'}/{rec.get('Model')}",
+            "b": "pos." if b == "positive" else "neg.",
+            "Budget": _compact_budget_cell(cha_ab, bf_ab),
+            "Overall": _compact_recall_cell(int(rec.get("overall_recovered", 0)), int(rec.get("overall_bf", 0))),
+        }
+        for _, _, label, _ in specs:
+            c = rec.get("bin_counts", {}).get(label, {"recovered": 0, "bf": 0})
+            r = int(c.get("recovered", 0))
+            t = int(c.get("bf", 0))
+            total_bins[label]["recovered"] += r
+            total_bins[label]["bf"] += t
+            row[label] = _compact_recall_cell(r, t)
+        rows.append(row)
+    total_row = {
+        "Task/model": "All completed",
+        "b": "all",
+        "Budget": _compact_budget_cell(total_cha_ab, total_bf_ab),
+        "Overall": _compact_recall_cell(total_recovered, total_bf),
+    }
+    for _, _, label, _ in specs:
+        total_row[label] = _compact_recall_cell(total_bins[label]["recovered"], total_bins[label]["bf"])
+    if rows:
+        rows.append(total_row)
+    return pd.DataFrame(rows)
+
+
 def _table3(
     data_root: Path,
     out_dir: Path,
@@ -940,6 +1370,8 @@ def _table3(
     baseline_subset: str,
     scope: str = "all",
     tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS,
+    paper_tables_root: Optional[Path] = None,
+    brute_force_candidate_cap: int = DEFAULT_BRUTEFORCE_CANDIDATE_CAP,
 ) -> pd.DataFrame:
     if scope == "selected":
         records = _table3_collect_baseline_records(
@@ -948,22 +1380,45 @@ def _table3(
             tasks=[task],
             model_spec=model_spec,
             baseline_subsets=[baseline_subset],
+            brute_force_candidate_cap=brute_force_candidate_cap,
         )
     else:
-        records = _table3_collect_baseline_records(data_root, bins=bins, tasks=tasks)
+        records = _table3_collect_baseline_records(data_root, bins=bins, tasks=tasks, brute_force_candidate_cap=brute_force_candidate_cap)
+
+    if not records:
+        records = _collect_table3_records_from_precomputed(
+            data_root,
+            out_dir,
+            bins=bins,
+            paper_tables_root=paper_tables_root,
+            brute_force_candidate_cap=brute_force_candidate_cap,
+        )
+        if records:
+            print("[table3] using precomputed Table 3/12 artifacts because raw neuron_buckets.json artifacts were not found")
 
     df = _table3_aggregate_records(records, bins=bins, include_per_model=True)
     if df.empty:
-        df = pd.DataFrame(columns=["Task", "Model", "Baseline", "Overall", "#completed experiments"] + [label for _, _, label, _ in _table3_bin_specs(bins)])
+        df = pd.DataFrame(columns=["Task", "Model", "Baseline", "Budget", "CHA ablations", "BF ablations", "Overall", "#completed experiments"] + [label for _, _, label, _ in _table3_bin_specs(bins)])
     _write_table_artifacts(
         df,
         out_dir,
         "table3_compact_bf_vs_cha",
         caption=(
             "Table 3: Compact BF-vs-CHA comparison for rule split + spectral coverage vs. brute-force search. "
-            "Counts are baseline-specific and CHA recovery is restricted to the brute-force circuit(s)."
+            "Budget is CHA group ablations divided by the matched brute-force budget, 2N-1."
         ),
     )
+    e2_df = _table3_e2_from_records(records, bins=bins)
+    if not e2_df.empty:
+        _write_table_artifacts(
+            e2_df,
+            out_dir,
+            "table3_e2_recall_budget",
+            caption=(
+                "E2: CHA recall and ablation budget versus brute force. "
+                "Budget is CHA group ablations divided by the matched brute-force budget, 2N-1."
+            ),
+        )
     meta = {
         "compared_runs": {
             "cha": MAIN_RUN,
@@ -988,6 +1443,13 @@ def _table3(
                 "comparison_circuit_ids": rec.get("comparison_circuit_ids", []),
                 "overall_bf": rec["overall_bf"],
                 "overall_recovered": rec["overall_recovered"],
+                "cha_ablation_count": rec.get("cha_ablation_count", 0),
+                "cha_ablation_parts": rec.get("cha_ablation_parts", ""),
+                "cha_ablation_source": rec.get("cha_ablation_source", ""),
+                "bf_ablation_count": rec.get("bf_ablation_count", 0),
+                "bf_ablation_source": rec.get("bf_ablation_source", ""),
+                "precomputed_table3_source": rec.get("precomputed_table3_source", ""),
+                "precomputed_table12_source": rec.get("precomputed_table12_source", ""),
             }
             for rec in records
         ],
@@ -1339,6 +1801,8 @@ def main():
     ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage numerator: all rule-bearing localized neurons (paper default) or HQ-only neurons. Directional rates are normalized by eligible source examples.")
     ap.add_argument("--include_hans_in_main_tables", action="store_true", help="Include HANS/NLI in Tables 1-3/12 when matching compatible artifacts exist. The paper main tables omit HANS.")
     ap.add_argument("--table3_scope", type=str, default="all", choices=["all", "selected"], help="Table 3 scope. 'all' reproduces the paper compact table; 'selected' honors --table3_task/--table3_model/--baseline_subset.")
+    ap.add_argument("--paper_tables_root", type=str, default=None, help="Optional directory containing precomputed paper table CSVs. Used as a fallback when raw neuron_buckets/rule_knockout artifacts are absent.")
+    ap.add_argument("--bruteforce_candidate_cap", type=int, default=DEFAULT_BRUTEFORCE_CANDIDATE_CAP, help="Cap used when inferring the brute-force candidate count N from model architecture before applying denominator 2*N-1.")
     ap.add_argument("--cha_rank_metric", type=str, default="c2i", choices=["c2i", "i2c", "flip_any"], help="Metric used to rank CHA neurons in Tables 10-11. The paper's Qwen2 arithmetic appendix uses c2i.")
     ap.add_argument("--notes_only", action="store_true", help="Only write a note about unsupported manual tables 4-8.")
     args = ap.parse_args()
@@ -1380,7 +1844,7 @@ def main():
         print(df.to_string(index=False) if not df.empty else "[table2] no rows")
 
     if "table3" in which:
-        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset, scope=args.table3_scope, tasks=main_table_tasks)
+        df = _table3(data_root, out_root, task=args.table3_task, model_spec=args.table3_model, tau=args.tau, bins=bins, baseline_subset=args.baseline_subset, scope=args.table3_scope, tasks=main_table_tasks, paper_tables_root=Path(args.paper_tables_root).resolve() if args.paper_tables_root else None, brute_force_candidate_cap=args.bruteforce_candidate_cap)
         results["table3_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table3] no rows")
 

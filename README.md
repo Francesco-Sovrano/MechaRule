@@ -266,19 +266,21 @@ python 4_spectral_sample_datapoints.py \
 
 ### 5. Discover circuits
 
+The main paper uses EAP-IG input attribution as a high-recall candidate reducer with a top-M export budget of 100,000. Smaller `--circuit_size` values are useful for debugging only.
+
 ```bash
 python 5_discover_circuits.py \
   --rules_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/rule_extraction_results \
   --rules_glob "optimal_rule_set" \
   --features_scores_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report \
-  --output_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap/neural_circuits \
+  --output_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap_ig_inputs/neural_circuits \
   --ai_model Qwen/Qwen2-1.5B-Instruct \
   --cache_dir ./cache/arithmetic/Qwen/Qwen2-1.5B-Instruct \
-  --method EAP \
+  --method EAP-IG-inputs \
   --intervention patching \
   --eval_intervention mean-positional \
   --circuit_level neuron \
-  --circuit_size 256 \
+  --circuit_size 100000 \
   --max_pairs_per_circuit 128 \
   --sampling_strategy plan \
   --sampling_plan_path ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_sampling_plan.json \
@@ -287,16 +289,25 @@ python 5_discover_circuits.py \
 
 ### 6. Run grouped ablations
 
+The main grouped-ablation runs use decode-only MLP-write interventions, strength-based CHA pruning, and an optional root split by signed discovery score. Selectivity is recorded after localization rather than used as an inclusion filter.
+
 ```bash
 python 6_analyze_bag_of_rules.py \
-  --input_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap/neural_circuits \
-  --output_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap/agonist_neurons-fast-spectral_anchor \
+  --input_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap_ig_inputs/neural_circuits \
+  --output_data_dir ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_plan/eap_ig_inputs/agonist_neurons-fast-spectral_anchor \
   --scores_path ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/feature_report/scores.csv \
   --ai_model Qwen/Qwen2-1.5B-Instruct \
   --intervention mean-positional \
   --points_to_use_for_mean_ablation 256 \
   --sampling_strategy plan \
   --sampling_plan_path ./data/arithmetic/Qwen/Qwen2-1.5B-Instruct/neural_circuit_discovery_results/spectral_sampling_plan.json \
+  --n_associated 64 \
+  --n_unrelated 64 \
+  --search_epsilon 0.2 \
+  --fast_ablation \
+  --decode_only \
+  --mlp_neurons_only \
+  --sign_split_first \
   --task_module lib.tasks.arithmetic_task
 ```
 
@@ -306,7 +317,7 @@ python 6_analyze_bag_of_rules.py \
 python 7_refine_neuron_anchored_rules.py --help
 ```
 
-This step reads the step-6 per-rule outputs, filters single-neuron candidates by effect and selectivity criteria, writes flip-target columns, and can optionally run rule extraction again on those flip targets.
+This step reads the step-6 per-rule outputs, filters single-neuron candidates by strength/effect (`max_effect`), writes flip-target columns, and can optionally run rule extraction again on those flip targets. Selectivity diagnostics are retained for reporting.
 
 ## Built-in tasks
 
@@ -363,7 +374,7 @@ cache/<task>/<model>/
 - Most scripts expose `--seed` or `--random_seed` and call deterministic seeding utilities.
 - Spectral representations can be cached with `--spectral_cache_dir`.
 - Circuit discovery and ablation are compute-heavy. Start with smaller `--circuit_size`, `--max_points_per_ablation`, and `--max_number_of_circuits_to_analyze` values when debugging.
-- `EAP` is faster. `EAP-IG` and input-gradient variants are slower but can give higher-quality attribution.
+- `EAP` is faster and useful for debugging. The main paper settings use `EAP-IG-inputs` with `--circuit_size 100000`; EAP-IG and input-gradient variants are slower but can give higher-quality attribution.
 - The HANS task downloads data unless `HANS_LOCAL_FILE` points to an existing local file.
 - Set `HF_HUB_OFFLINE=1` only after the required Hugging Face models and datasets are cached locally.
 

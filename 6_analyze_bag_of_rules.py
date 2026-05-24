@@ -104,12 +104,11 @@ def parse_args():
 		type=float,
 		default=0.2,
 		help=(
-			"Minimum |max_effect| needed to continue splitting a neuron group in the "
-			"dichotomic search. Groups whose effect on (acc_unrelated - acc_associated) "
-			"is below this threshold are treated as 'useless' and not split further. "
-			"Set <= 0 to always fully split down to single neurons. "
-			"This same value is also used as the |max_effect| threshold for bucketing "
-			"single-neuron non-catastrophic agonists."
+			"Strength threshold tau used by CHA. Groups are split while the one-sided "
+			"UCB on compact-slice flip-rate strength remains at least this value. "
+			"Set <= 0 to fully split down to single neurons. Singletons are retained "
+			"by the same strength criterion; selectivity is recorded for reporting "
+			"rather than used for pruning or inclusion."
 		),
 	)
 	p.add_argument(
