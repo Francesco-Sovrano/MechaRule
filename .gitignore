@@ -8,6 +8,7 @@ data/*
 notes.txt
 paper_tables/
 results/
+all_details/
 intervention_shift/
 _*
 

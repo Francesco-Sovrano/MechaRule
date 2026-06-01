@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # set -euo pipefail
 
+MIN_RULE_DATASET_COVERAGE="${MIN_RULE_DATASET_COVERAGE:-0.005}"
+
 ############################################
 # Usage:
 #   ./_run_pipeline.sh <EXPERIMENT_NAME> <ANALYZED_LLM> \
@@ -716,6 +718,7 @@ python3 7_refine_neuron_anchored_rules.py \
 	--extract_rules \
 	--only_unique_datapoints_in_shap \
 	"${DECODE_FLAG[@]}" \
-	--summarize_rule_metrics
+	--summarize_rule_metrics \
+	--min_rule_dataset_coverage "$MIN_RULE_DATASET_COVERAGE"
 
 echo "Done."

@@ -389,12 +389,26 @@ def _rate_pct(value: object) -> float:
     return 100.0 * v if math.isfinite(v) else float("nan")
 
 
-def _load_hq_summary(stats_dir: Path, *, fallback_n_identified: int) -> dict:
-    """Load script-7 high-quality summary, with rule-metrics fallback if HQ coverage was not written."""
+def _load_hq_summary(
+    stats_dir: Path,
+    *,
+    fallback_n_identified: int,
+    label: str = "run",
+    strict_hq_coverage: bool = True,
+) -> dict:
+    """Load script-7 high-quality summary without silently turning missing HQ coverage into zeros.
+
+    `rule_metrics_summary.json` can tell us how many high-quality neurons exist, but it
+    cannot tell us which evaluated rows those HQ neurons flipped.  The row-level union
+    coverage needed for the bottom-right HQ prevalence panel is only in
+    `high_quality_neuron_flip_coverage.json`.  If HQ neurons exist and that coverage
+    file/block is missing, silently plotting 0% is misleading, so strict mode raises.
+    """
     hq_path = stats_dir / "high_quality_neuron_flip_coverage.json"
     rule_path = stats_dir / "rule_metrics_summary.json"
     hq = _read_json(hq_path)
     rule = _read_json(rule_path)
+    hq_loaded = bool(hq)
 
     quality_metric_label = hq.get("quality_metric_label") or rule.get("quality_metric_label")
     quality_threshold = hq.get("quality_threshold") if hq else rule.get("quality_threshold")
@@ -420,8 +434,17 @@ def _load_hq_summary(stats_dir: Path, *, fallback_n_identified: int) -> dict:
 
     frac_hq = (float(n_hq_i) / float(n_identified_i)) if (n_hq_i is not None and n_identified_i) else float("nan")
 
+    missing_reasons: List[str] = []
+    # The HQ-overview prevalence figure only plots these three blocks.
+    # `flip_semantic_wrong` is an optional diagnostic block in script-7 artifacts;
+    # older/current coverage JSONs may contain only union/count fields for it and no
+    # prevalence denominator.  Do not fail the plot just because that optional block
+    # is incomplete.
+    required_prevalence_blocks = {"flip_any", "flip_c2i", "flip_i2c"}
+
     def flip_block(name: str) -> dict:
         block = hq.get(name, {}) if isinstance(hq, dict) else {}
+        block_available = isinstance(block, dict) and bool(block)
         if not isinstance(block, dict):
             block = {}
         union_all = block.get("union_all")
@@ -447,10 +470,27 @@ def _load_hq_summary(stats_dir: Path, *, fallback_n_identified: int) -> dict:
             all_pct = float("nan")
             high_pct = float("nan")
             den_label = "rows"
-        coverage = block.get("union_share_of_all")
-        if coverage is None:
-            coverage = _to_float(union_high) / _to_float(union_all) if _to_float(union_all) else float("nan")
+        union_share_of_all = block.get("union_share_of_all")
+        if union_share_of_all is None:
+            union_share_of_all = _to_float(union_high) / _to_float(union_all) if _to_float(union_all) else float("nan")
+
+        # The HQ-overview panel is a prevalence-over-eligible-points panel.
+        # Keep the old union-high / union-all diagnostic as a separate field,
+        # but make the displayed/CSV "coverage" value use the same denominator
+        # as the plotted points: eligible/evaluated rows.
+        hq_eligible_points_pct = high_pct
+
+        # A block is complete for plotting when the all/HQ prevalence values are
+        # finite.  For n_hq == 0, a true 0% HQ prevalence is valid if the script-7
+        # coverage file exists; if it does not exist, the value is informationally
+        # missing rather than measured.
+        block_complete = block_available and math.isfinite(all_pct) and math.isfinite(high_pct)
+        if n_hq_i and n_hq_i > 0 and name in required_prevalence_blocks and not block_complete:
+            missing_reasons.append(name)
+
         return {
+            "available": bool(block_available),
+            "complete": bool(block_complete),
             "union_all": _jsonable(union_all),
             "union_high": _jsonable(union_high),
             "sum_all": _jsonable(sum_all),
@@ -459,12 +499,17 @@ def _load_hq_summary(stats_dir: Path, *, fallback_n_identified: int) -> dict:
             "denominator_label": den_label,
             "all_union_pct": all_pct,
             "high_union_pct": high_pct,
-            "hq_coverage_share_pct": _rate_pct(coverage),
+            "hq_eligible_points_pct": hq_eligible_points_pct,
+            # Backwards-compatible name now uses the prevalence denominator
+            # (eligible/evaluated rows), not union_all.
+            "hq_coverage_share_pct": hq_eligible_points_pct,
+            "hq_union_share_of_all_pct": _rate_pct(union_share_of_all),
         }
 
-    return {
+    result = {
         "available": bool(hq) or bool(rule),
         "coverage_json": str(hq_path) if hq_path.exists() else None,
+        "coverage_json_loaded": bool(hq_loaded),
         "rule_metrics_json": str(rule_path) if rule_path.exists() else None,
         "quality_metric_label": quality_metric_label or "HQ metric",
         "quality_threshold": _jsonable(quality_threshold),
@@ -474,8 +519,23 @@ def _load_hq_summary(stats_dir: Path, *, fallback_n_identified: int) -> dict:
         "flip_any": flip_block("flip_any"),
         "flip_c2i": flip_block("flip_c2i"),
         "flip_i2c": flip_block("flip_i2c"),
+        # Optional diagnostic block: included in CSV/JSON output when present, but
+        # not required for the HQ prevalence overview.
         "flip_semantic_wrong": flip_block("flip_semantic_wrong"),
     }
+
+    result["hq_flip_coverage_complete"] = not missing_reasons
+    result["hq_flip_coverage_missing_blocks"] = sorted(set(missing_reasons))
+    if missing_reasons:
+        msg = (
+            f"{label}: {n_hq_i} high-quality neurons are reported, but "
+            f"{hq_path.name} is missing/incomplete for: {', '.join(sorted(set(missing_reasons)))}. "
+            "Regenerate script-7 high_quality_neuron_flip_coverage.json before plotting HQ flip prevalence."
+        )
+        result["hq_flip_coverage_warning"] = msg
+        if strict_hq_coverage:
+            raise RuntimeError(msg)
+    return result
 
 
 def _hq_rows_for_csv(label: str, hq_summary: Mapping[str, object]) -> List[dict]:
@@ -509,6 +569,8 @@ def _hq_rows_for_csv(label: str, hq_summary: Mapping[str, object]) -> List[dict]
             "all_union_pct": block.get("all_union_pct"),
             "high_union_pct": block.get("high_union_pct"),
             "hq_coverage_share_pct": block.get("hq_coverage_share_pct"),
+            "hq_eligible_points_pct": block.get("hq_eligible_points_pct", block.get("high_union_pct")),
+            "hq_union_share_of_all_pct": block.get("hq_union_share_of_all_pct"),
         })
     return rows
 
@@ -633,17 +695,41 @@ def _save_hq_overview_plot(
             borderaxespad=0.0,
         )
 
+        hq_finite_vals: List[float] = []
+        hq_missing_labels: List[str] = []
         for i, lab in enumerate(labels):
             vals = np.asarray([_to_float(records[lab].get(d, {}).get("high_union_pct")) for d in directions], dtype=float)
+            finite = vals[np.isfinite(vals)]
+            if finite.size:
+                hq_finite_vals.extend(finite.tolist())
+            n_hq_lab = _to_float(records[lab].get("n_high_quality_neurons"))
+            coverage_complete = bool(records[lab].get("hq_flip_coverage_complete", True))
+            if n_hq_lab > 0 and (not coverage_complete or finite.size == 0):
+                hq_missing_labels.append(lab)
             ax_cov.plot(xd, vals, marker="o", linewidth=1.4, label=f"{lab}: HQ")
-            cov_vals = np.asarray([_to_float(records[lab].get(d, {}).get("hq_coverage_share_pct")) for d in directions], dtype=float)
-            for xx, yy, cov in zip(xd, vals, cov_vals):
-                if yy == yy and cov == cov:
-                    ax_cov.annotate(f"cov {cov:.0f}%", (xx, yy), ha="center", va="bottom", fontsize=6.5, xytext=(0, 4), textcoords="offset points")
+            eligible_vals = np.asarray([
+                _to_float(records[lab].get(d, {}).get("hq_eligible_points_pct", records[lab].get(d, {}).get("high_union_pct")))
+                for d in directions
+            ], dtype=float)
+            for xx, yy, elig in zip(xd, vals, eligible_vals):
+                if yy == yy and elig == elig:
+                    ax_cov.annotate(f"{elig:.1f}%", (xx, yy), ha="center", va="bottom", fontsize=6.5, xytext=(0, 4), textcoords="offset points")
         ax_cov.set_xticks(xd)
         ax_cov.set_xticklabels([s.replace("→", "→\n") for s in direction_labels])
         ax_cov.set_ylabel("Unique flips / eligible points (%)")
         ax_cov.set_title("Flip prevalence, high-quality neurons")
+        if hq_finite_vals:
+            ax_cov.set_ylim(0, max(100.0, max(hq_finite_vals) * 1.16))
+        else:
+            ax_cov.set_ylim(0, 100.0)
+        if hq_missing_labels:
+            ax_cov.text(
+                0.5, 0.5,
+                "HQ flip coverage missing for: " + ", ".join(hq_missing_labels),
+                transform=ax_cov.transAxes,
+                ha="center", va="center", fontsize=8,
+                bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+            )
         ax_cov.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.45)
         ax_cov.legend(frameon=False, ncol=2)
 
@@ -847,7 +933,7 @@ def _write_markdown_report(path: Path, summary: Mapping[str, object], top_change
                 lines.append(
                     f"- `{key}`: all={_format_float(block.get('all_union_pct'), 2)}%, "
                     f"HQ={_format_float(block.get('high_union_pct'), 2)}%, "
-                    f"HQ coverage={_format_float(block.get('hq_coverage_share_pct'), 1)}%"
+                    f"HQ eligible_points={_format_float(block.get('hq_eligible_points_pct', block.get('high_union_pct')), 1)}%"
                 )
             lines.append("")
     lines.extend([
@@ -1090,8 +1176,18 @@ def _run_stats_dir_mode(args: argparse.Namespace) -> bool:
         "candidate_intervention": candidate_label,
     }
 
-    baseline_hq = _load_hq_summary(baseline_dir, fallback_n_identified=int(len(baseline)))
-    candidate_hq = _load_hq_summary(candidate_dir, fallback_n_identified=int(len(candidate)))
+    baseline_hq = _load_hq_summary(
+        baseline_dir,
+        fallback_n_identified=int(len(baseline)),
+        label=baseline_label,
+        strict_hq_coverage=not bool(args.allow_missing_hq_coverage),
+    )
+    candidate_hq = _load_hq_summary(
+        candidate_dir,
+        fallback_n_identified=int(len(candidate)),
+        label=candidate_label,
+        strict_hq_coverage=not bool(args.allow_missing_hq_coverage),
+    )
     hq_rows = _hq_rows_for_csv(baseline_label, baseline_hq) + _hq_rows_for_csv(candidate_label, candidate_hq)
     hq_csv_path = output_dir / "intervention_shift_hq_summary.csv"
     if hq_rows:
@@ -1117,7 +1213,7 @@ def _run_stats_dir_mode(args: argparse.Namespace) -> bool:
             candidate_label: _intervention_description(candidate_label),
         },
         "high_quality_comparison": {
-            "source": "high_quality_neuron_flip_coverage.json, with rule_metrics_summary.json fallback",
+            "source": "high_quality_neuron_flip_coverage.json for HQ flip prevalence; rule_metrics_summary.json only for HQ counts fallback",
             "runs": {
                 baseline_label: baseline_hq,
                 candidate_label: candidate_hq,
@@ -1317,6 +1413,15 @@ def main() -> None:
     ap.add_argument("--task_name", default=None, help="Task name/module to show in reports/figures")
     ap.add_argument("--model_name", default=None, help="Model name/id to show in reports/figures")
     ap.add_argument("--no_plots", action="store_true", help="Write only CSV/JSON/Markdown, no matplotlib figures")
+    ap.add_argument(
+        "--allow_missing_hq_coverage",
+        action="store_true",
+        help=(
+            "Do not fail when rule_metrics_summary.json reports HQ neurons but "
+            "high_quality_neuron_flip_coverage.json is missing/incomplete. The HQ "
+            "prevalence panel will be marked as missing instead of silently plotted as 0%."
+        ),
+    )
     args = ap.parse_args()
 
     if _run_stats_dir_mode(args):

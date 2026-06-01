@@ -42,10 +42,10 @@ The pipeline is designed for auditing learned behaviours in open-weight LLMs. So
 | `4_spectral_sample_datapoints.py` | Build rule-specific or baseline-specific sampling plans with spectral coverage and optional length-matched pairing. |
 | `5_discover_circuits.py` | Discover rule-associated circuits using EAP or EAP-IG-style attribution. |
 | `6_analyze_bag_of_rules.py` | Run grouped ablations to find promising agonist-rich neuron groups. |
-| `7_refine_neuron_anchored_rules.py` | Refine grouped candidates to single-neuron candidates and optionally re-extract neuron-anchored rules. |
+| `7_refine_neuron_anchored_rules.py` | Refine grouped candidates to single-neuron candidates and optionally re-extract neuron-anchored rules. Anchored rule combos are selected on TRAIN and, by default, scored on both held-out TEST and descriptive ALL-FIT scopes. |
 | `8_compare_experiments.py` | Aggregate run-mode results within a task or data tree. |
 | `9_compare_models.py` | Compare results across analysed LLMs for one task. |
-| `10_compute_threshold_sweep_stats.py` | Compute threshold-sweep summary statistics from aggregated results. |
+| `10_compute_threshold_sweep_stats.py` | Compute threshold-sweep summary statistics from aggregated results. By default it reports both TEST and ALL-FIT scopes separately. |
 | `11_summarize_sensitivity_analysis.py` | Summarize sensitivity-analysis runs. |
 
 ### Orchestration and utility scripts
@@ -57,7 +57,7 @@ The pipeline is designed for auditing learned behaviours in open-weight LLMs. So
 | `run_sensitivity_analysis.sh` | Runs threshold and configuration sensitivity checks. |
 | `run_resample_recheck.sh` | Rechecks selected runs under an alternative intervention configuration. |
 | `run_paper_tables_generation.sh` | Generates paper-oriented summary tables. |
-| `make_paper_tables.py` | Builds paper summary tables from completed experiment outputs. |
+| `make_paper_tables.py` | Builds paper summary tables from completed experiment outputs, reporting both held-out TEST HQ counts and descriptive ALL-FIT HQ counts by default. |
 | `clean_results_for_export.py` | Removes or normalizes bulky generated artifacts before exporting results. |
 
 ### Core library modules
@@ -357,7 +357,8 @@ data/<task>/<model>/
     neuron_flip_rules*/
       stats/<run_mode>/
         scores.csv
-        rule_combo_metrics_*.csv
+        rule_combo_metrics_test_*.csv
+        rule_combo_metrics_all_fit.csv
         flip_stats_*.csv
         flip_stats_*.json
   neural_circuit_discovery_results*/
@@ -375,6 +376,26 @@ cache/<task>/<model>/
   spectral_reps_*.pt or .npy
   model-call caches
 ```
+
+### HQ score scopes
+
+Neuron-anchored rules report two default score scopes:
+
+- **TEST**: combo selected on TRAIN only and scored on `is_test == True`; use this as the strict generalization estimate.
+- **ALL-FIT**: separate descriptive final-fit combo selected and scored on all evaluated rows for the target, including every evaluated held-out test row. This is useful for descriptive rule inspection and small/imbalanced targets, but it is not held-out evidence.
+
+`make_paper_tables.py` reports both scopes by default through `--score_scopes test,all_fit`. `run_paper_tables_generation.sh` also runs downstream threshold statistics for both scopes by default.
+
+Raw per-neuron files are:
+
+```text
+rule_combo_<target>.csv            # TEST score for the train-selected frozen combo
+rule_combo_all_fit_<target>.csv    # ALL-FIT descriptive final-fit score
+```
+
+Use `--no_emit_all_fit_rules` to avoid computing the descriptive ALL-FIT scope.
+
+The high-quality flip-coverage diagnostics use the same dual-scope convention by default. `high_quality_neuron_flip_coverage.pdf` and `high_quality_neuron_flip_coverage_by_layer.pdf` show all rule-bearing neurons, HQ(TEST), and HQ(ALL-FIT).
 
 ## Reproducibility and performance notes
 

@@ -16,6 +16,7 @@ from tqdm import tqdm
 import copy
 import hashlib
 import pickle
+import gc
 
 
 # Local utils (expected to exist in your repo, as in the script you shared)
@@ -71,6 +72,36 @@ _RULE_METRIC_SPECS = {
 	"tpr": ("TPR", "Sensitivity (TPR)"),
 	"tnr": ("TNR", "Specificity (TNR)"),
 }
+
+DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+
+def _filter_by_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+	"""Keep rule rows whose held-out dataset_coverage is large enough.
+
+	This prevents tiny-support rules (for example one evaluated datapoint) from
+	being counted as high-quality merely because their held-out MCC is perfect.
+	Set min_dataset_coverage <= 0 to disable.  If coverage is unavailable in an
+	older artifact, leave rows untouched rather than silently deleting the run.
+	"""
+	if df is None or df.empty:
+		return df
+	try:
+		floor = float(min_dataset_coverage)
+	except Exception:
+		floor = DEFAULT_MIN_RULE_DATASET_COVERAGE
+	if floor <= 0:
+		return df.copy()
+	cov_col = None
+	for c in ("dataset_coverage", "coverage"):
+		if c in df.columns:
+			cov_col = c
+			break
+	if cov_col is None:
+		return df.copy()
+	out = df.copy()
+	cov = pd.to_numeric(out[cov_col], errors="coerce")
+	return out[cov >= floor].copy()
 
 def parse_args():
 	ap = argparse.ArgumentParser(
@@ -220,7 +251,6 @@ def parse_args():
 			"but leave flip columns as NA for those rows (still no propagation)."
 		),
 	)
-	
 	add_spectral_cli_args(ap)
 	
 	ap.add_argument(
@@ -386,6 +416,28 @@ def parse_args():
 			"Threshold applied to --rule_quality_metric to count/plot 'high-quality' neurons. "
 		),
 	)
+	ap.add_argument(
+		"--min_rule_dataset_coverage",
+		type=float,
+		default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
+		help=(
+			"Minimum held-out dataset_coverage required before a rule can contribute to "
+			"best-per-neuron summaries, high-quality counts, threshold sweeps, or HQ coverage plots. "
+			"Use 0 to disable. Default: 0.005."
+		),
+	)
+
+	ap.add_argument(
+		"--no_emit_all_fit_rules",
+		dest="emit_all_fit_rules",
+		action="store_false",
+		help=(
+			"Do not compute descriptive ALL-FIT rule combos. By default, Stage 7 emits "
+			"rule_combo_all_fit_<target>.csv selected and scored on all available rows; "
+			"these are descriptive only and are not held-out HQ scores."
+		),
+	)
+	ap.set_defaults(emit_all_fit_rules=True)
 
 	# SHAP + RuleSHAP knobs (mirrors 3_extract_arithmetic_rules)
 	ap.add_argument(
@@ -807,7 +859,7 @@ def _series_value_hash(s: pd.Series) -> int:
 	h = pd.util.hash_pandas_object(v, index=False)
 	return int(h.sum())
 
-def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targets, args, features_json_fingerprint=None) -> dict:
+def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targets, args, features_json_fingerprint=None, eval_df: pd.DataFrame = None) -> dict:
 	"""
 	Compute a lightweight signature so we can skip rule extraction when outputs already exist
 	and the inputs haven't changed.
@@ -834,11 +886,13 @@ def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targ
 		"use_shap_in_lasso": bool(getattr(args, "use_shap_in_lasso", False)),
 		"only_unique_datapoints_in_rule_extraction": bool(getattr(args, "only_unique_datapoints_in_rule_extraction", False)),
 		"semantic_quality_policy": str(getattr(args, "semantic_quality_policy", "none")),
+		"emit_all_fit_rules": bool(getattr(args, "emit_all_fit_rules", True)),
 	}
 
 	input_feature_names = list(map(str, input_features))
 	return {
 		"n_rows": int(len(rules_df)),
+		"n_eval_rows": int(len(eval_df)) if eval_df is not None else None,
 		"targets": list(map(str, targets)),
 		"target_hashes": target_hashes,
 		"input_features_sha1": _sha1_of_obj(input_feature_names),
@@ -849,14 +903,32 @@ def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targ
 def _rule_signature_path(rules_subdir):
 	return Path(rules_subdir) / "_rule_extraction_signature.json"
 
-def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=None):
+def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=None, force_recompute: bool = False, require_all_fit: bool = True, targets=None):
+	"""Skip only when every required raw output exists and signature matches.
+
+	Required raw outputs are rule_combo_train_<target>.csv and rule_combo_<target>.csv
+	for every target.  When ALL-FIT emission is enabled,
+	rule_combo_all_fit_<target>.csv is also required.  ALL-FIT is not a raw
+	artifact and is never part of the completeness check.
 	"""
-	Skip per-neuron rule extraction only when both the expected artifact exists
-	and the stored signature matches the current inputs/config.
-	"""
+	if force_recompute:
+		return False
 	rules_path = Path(rules_subdir)
-	artifact_path = rules_path / f"optimal_rule_set_{prefix}{layer_label}.csv"
-	if not artifact_path.exists():
+	if targets is None:
+		targets = [f"{prefix}{layer_label}"]
+	missing = []
+	for target in targets:
+		required = [
+			rules_path / f"rule_combo_train_{target}.csv",
+			rules_path / f"rule_combo_{target}.csv",
+		]
+		if require_all_fit:
+			required.append(rules_path / f"rule_combo_all_fit_{target}.csv")
+		for fp in required:
+			if (not fp.exists()) or fp.stat().st_size <= 0:
+				missing.append(fp.name)
+	if missing:
+		print(f"[Rules] Cache incomplete in {rules_path}: missing {missing[:6]}{'...' if len(missing) > 6 else ''}")
 		return False
 	if signature is None:
 		return True
@@ -1770,11 +1842,32 @@ def collect_rule_combo_metrics(rules_dir: str):
 	for fp in root.glob("**/rule_combo_*.csv"):
 		if not fp.is_file():
 			continue
+		# Only per-neuron RuleSHAP combo artifacts belong here.  Summary files such as
+		# stats/.../rule_combo_metrics_* also match the glob and can feed stale
+		# TEST/ALL-FIT rows back into the loader.  Treat stats output as write-only.
+		try:
+			rel_probe = fp.relative_to(root)
+		except Exception:
+			rel_probe = fp
+		if str(fp.name).startswith("rule_combo_metrics_") or "stats" in tuple(rel_probe.parts):
+			continue
+			# Valid raw per-neuron combo artifacts are only:
+		#   rule_combo_<target>.csv              -> held-out TEST score
+		#   rule_combo_train_<target>.csv        -> TRAIN-selection diagnostic
+		# ALL-FIT is a separate descriptive final-fit raw scope.  Raw
+		# rule_combo_train_test_<target>.csv files are obsolete and ignored.
 		rel = fp.relative_to(root)
 		parts = rel.parts
+		# Usual layout is <rule_target>/<layer>_<neuron>/rule_combo_*.csv.
+		# Some debugging/export zips contain only the neuron directory itself
+		# (e.g. m0_72/rule_combo_*.csv); infer that case so TRAIN and TEST
+		# rows still share the same key and can be merged.
 		if len(parts) >= 3:
 			rule_target_dir = parts[0]
 			neuron_dir = parts[-2]
+		elif fp.parent == root and re.match(r"^(.*)_(\d+)$", root.name):
+			rule_target_dir = root.parent.name if root.parent != root else ""
+			neuron_dir = root.name
 		else:
 			rule_target_dir = parts[0] if parts else ""
 			neuron_dir = parts[-2] if len(parts) >= 2 else ""
@@ -1783,13 +1876,46 @@ def collect_rule_combo_metrics(rules_dir: str):
 		layer_key = m.group(1) if m else str(neuron_dir)
 		neuron_id = int(m.group(2)) if m else None
 
-		metric = fp.name[len("rule_combo_"):-len(".csv")] if fp.name.startswith("rule_combo_") else fp.name
+		filename_scope = "test" if (fp.parent / "global_shap_stats_train.pkl").exists() else "train_or_all"
+		filename_is_train = False
+		filename_is_all_fit = False
+		if fp.name.startswith("rule_combo_train_test_"):
+			# Obsolete raw TRAIN+TEST artifact from an earlier implementation.
+			# Never load it.
+			continue
+		elif fp.name.startswith("rule_combo_all_fit_"):
+			metric = fp.name[len("rule_combo_all_fit_"):-len(".csv")]
+			filename_scope = "all_fit"
+			filename_is_all_fit = True
+		elif fp.name.startswith("rule_combo_train_"):
+			metric = fp.name[len("rule_combo_train_"):-len(".csv")]
+			filename_scope = "train"
+			filename_is_train = True
+		else:
+			metric = fp.name[len("rule_combo_"):-len(".csv")] if fp.name.startswith("rule_combo_") else fp.name
 		df = pd.read_csv(fp)
 		if df.empty:
 			continue
 		r = df.iloc[0].to_dict()
 
-		computed_on = "eval" if (fp.parent / "global_shap_stats_train.pkl").exists() else "train_or_all"
+		# Filename scope is authoritative for rule_combo_train_* artifacts.
+		# Obsolete raw rule_combo_train_test_* artifacts have already been skipped;
+		# ALL-FIT rows are loaded from rule_combo_all_fit_* files.
+		if filename_is_train:
+			computed_on = "train"
+		elif filename_is_all_fit:
+			computed_on = "all_fit"
+		else:
+			computed_on = str(r.get("computed_on", r.get("score_scope", filename_scope)) or filename_scope)
+			_scope_norm = computed_on.strip().lower().replace("_", "+").replace("-", "+")
+			if _scope_norm in ("eval", "heldout", "held+out", "test"):
+				computed_on = "test"
+			elif _scope_norm in ("all+fit", "allfit", "final+all+fit", "finalfit"):
+				computed_on = "all_fit"
+			elif _scope_norm in ("all_fit", "train+eval", "all", "all+data", "traintest"):
+				computed_on = "all_fit"
+			elif _scope_norm.startswith("train"):
+				computed_on = "train"
 
 		expr = r.get("expression", r.get("rule_expression", ""))
 		n_atoms, n_disj, max_atoms = _parse_rule_lengths(expr)
@@ -1807,18 +1933,34 @@ def collect_rule_combo_metrics(rules_dir: str):
 			"neuron_key": f"{layer_key}_{neuron_id}" if neuron_id is not None else str(neuron_dir),
 			"flip_target": str(metric),
 			"computed_on": computed_on,
+			"score_scope": computed_on,
+			"P(target=1|fire)": _get_num(["P(target=1|fire)", "Precision", "precision", "P"], default=np.nan),
+			"Precision": _get_num(["Precision", "P(target=1|fire)", "precision", "P"], default=np.nan),
+			"R(fire|target=1)": _get_num(["R(fire|target=1)", "Recall", "recall", "TPR", "tpr"], default=np.nan),
 			"F1": _get_num(["F1", "F1(target=1|fire)", "f1"]),
 			"MCC": _get_num(["MCC", "mcc"]),
 			"TPR": _get_num(["TPR", "tpr"]),
 			"TNR": _get_num(["TNR", "tnr"]),
 			"BalancedAcc": _get_num(["BalancedAcc", "balancedacc", "balanced_acc"]),
 			"Acc": _get_num(["Acc", "acc", "accuracy"]),
-			"dataset_coverage": _get_num(["dataset_coverage", "coverage"]),
+			"dataset_coverage": _get_num(["dataset_coverage", "coverage", "rule_fire_rate"]),
+			"n_eval": _get_num(["n_eval"], default=np.nan),
+			"n_pos": _get_num(["n_pos"], default=np.nan),
+			"n_neg": _get_num(["n_neg"], default=np.nan),
+			"n_fire": _get_num(["n_fire"], default=np.nan),
+			"tp": _get_num(["tp"], default=np.nan),
+			"fp": _get_num(["fp"], default=np.nan),
+			"tn": _get_num(["tn"], default=np.nan),
+			"fn": _get_num(["fn"], default=np.nan),
+			"target_prevalence": _get_num(["target_prevalence"], default=np.nan),
+			"rule_fire_rate": _get_num(["rule_fire_rate"], default=np.nan),
 			"expression": str(expr),
 			"rule_len_atoms": int(n_atoms),
 			"rule_len_disjuncts": int(n_disj),
 			"rule_len_max_atoms_in_disjunct": int(max_atoms),
 			"rule_combo_path": str(fp),
+			"source_filename": fp.name,
+			"source_scope_from_filename": filename_scope,
 		})
 
 	if not rows:
@@ -1935,13 +2077,22 @@ def write_rule_metrics_stats(
 	length_cap: int = 30,
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	neurons_sorted=None,  # <-- NEW
+	scores_df: pd.DataFrame = None,
 ):
-	'''
+	"""
 	Writes paper-ready rule statistics/figures from RuleSHAP artifacts.
-	'''
+
+	Default behavior writes held-out TEST summaries (legacy filenames) and, when
+	available, parallel ALL-FIT descriptive summaries for the same
+	train-selected frozen combos.  The returned dataframe remains the TEST-only
+	best-per-neuron table so downstream high-quality flip-coverage plots preserve
+	the generalization metric by default.
+	"""
 	out_dir = str(out_dir)
-	Path(out_dir).mkdir(parents=True, exist_ok=True)
+	stats_dir = os.path.join(out_dir, 'stats', stats_dirname)
+	Path(stats_dir).mkdir(parents=True, exist_ok=True)
 
 	df_all = collect_rule_combo_metrics(rules_dir)
 	if df_all is None or df_all.empty:
@@ -1956,6 +2107,16 @@ def write_rule_metrics_stats(
 		df_all["neuron_rank"] = pd.NA
 		df_all["baseline_subset"] = ""
 
+	# ALL-FIT rows, when present, are loaded from raw rule_combo_all_fit_* files.
+	# They are not reconstructed from TRAIN/TEST rows.
+
+	n_rule_rows_before_coverage_filter = int(len(df_all))
+	df_all = _filter_by_min_dataset_coverage(df_all, min_dataset_coverage)
+	n_rule_rows_after_coverage_filter = int(len(df_all))
+	if df_all.empty:
+		print(f"[RuleMetrics] No rule rows remain after dataset_coverage >= {float(min_dataset_coverage):.6g}; skipping.")
+		return None
+
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
 	metric_label = _rule_metric_label(metric_key)
@@ -1966,35 +2127,30 @@ def write_rule_metrics_stats(
 		metric_col = "MCC"
 		metric_label = "MCC"
 
-	# Sort by neuron order first (if provided), then by quality within neuron.
-	sort_cols = (["neuron_rank"] if "neuron_rank" in df_all.columns else []) + [metric_col, "MCC"]
-	df_best = (
-		df_all.sort_values(sort_cols, ascending=[True] + [False, False], na_position="last")
-		.drop_duplicates(subset=["rule_target_dir", "neuron_key"], keep="first")
-		.reset_index(drop=True)
-	)
+	def _norm_scope(scope):
+		sv = str(scope or "test").strip().lower().replace("_", "+").replace(" ", "")
+		if sv in ("eval", "heldout", "held+out", "test"):
+			return "test"
+		if sv in ("all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data"):
+			return "all_fit"
+		if sv.startswith("train"):
+			return "train"
+		return sv
 
-	csv_all = os.path.join(out_dir, 'stats', stats_dirname, f"rule_combo_metrics_all.csv")
-	# Keep neuron order stable in the "all" dump; metric sort as secondary.
-	if "neuron_rank" in df_all.columns:
-		df_all_out = df_all.sort_values(["neuron_rank", metric_col, "MCC"], ascending=[True, False, False], na_position="last")
-	else:
-		df_all_out = df_all.sort_values([metric_col, "MCC"], ascending=False, na_position="last")
-	df_all_out.to_csv(csv_all, index=False)
+	def _scope_slug(scope):
+		return _norm_scope(scope).replace("+", "_").replace("-", "_")
 
-	print(f"[RuleMetrics] Wrote {csv_all}")
+	def _filter_scope(df, scope):
+		want = _norm_scope(scope)
+		if "computed_on" not in df.columns:
+			return df.copy() if want == "test" else df.iloc[0:0].copy()
+		vals = df["computed_on"].map(_norm_scope)
+		return df[vals == want].copy()
 
-	csv_best = os.path.join(out_dir, 'stats', stats_dirname, f"rule_combo_metrics_best_per_neuron.csv")
-	df_best.to_csv(csv_best, index=False)
-	print(f"[RuleMetrics] Wrote {csv_best}")
-
-	if topk is not None and int(topk) > 0:
-		df_top = df_best.sort_values([metric_col, "MCC"], ascending=False, na_position="last").head(int(topk)).copy()
-	else:
-		df_top = df_best.copy()
-	csv_top = os.path.join(out_dir, 'stats', stats_dirname, f"rule_combo_metrics_top_{int(topk) if topk else 'all'}.csv")
-	df_top.to_csv(csv_top, index=False)
-	print(f"[RuleMetrics] Wrote {csv_top}")
+	# Raw multi-scope dump for auditing. It can include train, test, and all_fit rows.
+	all_scopes_path = os.path.join(stats_dir, "rule_combo_metrics_all_scopes.csv")
+	df_all.to_csv(all_scopes_path, index=False)
+	print(f"[RuleMetrics] Wrote {all_scopes_path}")
 
 	q_lo, q_med, q_hi = quantiles
 
@@ -2013,31 +2169,6 @@ def write_rule_metrics_stats(
 			"max": float(np.max(v)),
 		}
 
-	high = df_best[pd.to_numeric(df_best[metric_col], errors="coerce") >= float(thr)]
-
-	summary = {
-		"n_rule_combo_files": int(len(df_all)),
-		"n_neurons_with_rules": int(len(df_best)),
-		"quality_metric": str(metric_key),
-		"quality_metric_label": str(metric_label),
-		"quality_threshold": float(thr),
-		"n_neurons_quality_ge_threshold": int(len(high)),
-		"frac_neurons_quality_ge_threshold": (float(len(high)) / float(len(df_best))) if len(df_best) else float("nan"),
-		"quantiles": [float(q_lo), float(q_med), float(q_hi)],
-		metric_col: _q(df_best[metric_col]) if metric_col in df_best.columns else {"n": 0},
-		"MCC": _q(df_best["MCC"]),
-		"F1": _q(df_best["F1"]),
-		"TPR": _q(df_best["TPR"]),
-		"TNR": _q(df_best["TNR"]),
-		"BalancedAcc": _q(df_best["BalancedAcc"]) if "BalancedAcc" in df_best.columns else {"n": 0},
-		"rule_len_atoms": _q(df_best["rule_len_atoms"]),
-		"dataset_coverage": _q(df_best["dataset_coverage"]),
-	}
-
-	json_path = os.path.join(out_dir, 'stats', stats_dirname, f"rule_metrics_summary.json")
-	Path(json_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-	print(f"[RuleMetrics] Wrote {json_path}")
-
 	def _pct(x):
 		return int(round(100.0 * float(x))) if x == x else None
 	def _fmt_float(x, nd=2):
@@ -2045,63 +2176,165 @@ def write_rule_metrics_stats(
 			return None
 		return f"{float(x):.{nd}f}"
 
-	tex_suffix = re.sub(r"[^0-9A-Za-z]+", "", str(stats_dirname))
-	tex_suffix = tex_suffix if tex_suffix else "Run"
+	def _summarize_scope(scope):
+		scope = _norm_scope(scope)
+		slug = _scope_slug(scope)
+		df_scope = _filter_scope(df_all, scope)
+		if df_scope.empty:
+			print(f"[RuleMetrics] No {scope} rule rows available after filtering; skipping {scope} summary.")
+			return None
 
-	tex_lines = []
-	tex_lines.append(f"% Auto-generated by 7_refine_neuron_anchored_rules (rule metrics)")
-	tex_lines.append(f"\\newcommand\\RuleQualMetric{tex_suffix}{{{metric_label}}}")
-	tex_lines.append(f"\\newcommand\\RuleQualThr{tex_suffix}{{{_fmt_float(thr,2)}}}")
-	tex_lines.append(f"\\newcommand\\RuleNeurons{tex_suffix}{{{int(summary['n_neurons_with_rules'])}}}")
-	tex_lines.append(f"\\newcommand\\RuleNeuronsHighQual{tex_suffix}{{{int(summary['n_neurons_quality_ge_threshold'])}}}")
-	tex_lines.append(f"\\newcommand\\RuleNeuronsHighQualPct{tex_suffix}{{{_pct(summary['frac_neurons_quality_ge_threshold'])}}}")
-	for key, macro in [("MCC","RuleMCC"), ("TPR","RuleTPR"), ("TNR","RuleTNR"), ("F1","RuleF1"), ("rule_len_atoms","RuleLen")]:
-		st = summary.get(key, {})
-		tex_lines.append(f"\\newcommand\\{macro}Med{tex_suffix}{{{_fmt_float(st.get('median', float('nan')),3)}}}")
-		tex_lines.append(f"\\newcommand\\{macro}Qlo{tex_suffix}{{{_fmt_float(st.get('q_lo', float('nan')),3)}}}")
-		tex_lines.append(f"\\newcommand\\{macro}Qhi{tex_suffix}{{{_fmt_float(st.get('q_hi', float('nan')),3)}}}")
-	tex_path = os.path.join(out_dir, 'stats', stats_dirname, f"rule_metrics.tex")
-	Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
-	print(f"[RuleMetrics] Wrote {tex_path}")
+		# Sort by neuron order first (if provided), then by quality within neuron.
+		sort_cols = (["neuron_rank"] if "neuron_rank" in df_scope.columns else []) + [metric_col, "MCC"]
+		df_best = (
+			df_scope.sort_values(sort_cols, ascending=[True] + [False, False], na_position="last")
+			.drop_duplicates(subset=["rule_target_dir", "neuron_key"], keep="first")
+			.reset_index(drop=True)
+		)
 
-	plt.figure(figsize=(12, 7))
+		# Keep neuron order stable in the "all" dump; metric sort as secondary.
+		if "neuron_rank" in df_scope.columns:
+			df_all_out = df_scope.sort_values(["neuron_rank", metric_col, "MCC"], ascending=[True, False, False], na_position="last")
+		else:
+			df_all_out = df_scope.sort_values([metric_col, "MCC"], ascending=False, na_position="last")
 
-	def _hist_col(col: str, xlabel: str, title: str, pos: int):
-		plt.subplot(2, 3, pos)
-		if col in df_best.columns:
-			v = pd.to_numeric(df_best[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
-			plt.hist(v, bins=30)
+		# Scope-specific files.
+		scope_all = os.path.join(stats_dir, f"rule_combo_metrics_{slug}_all.csv")
+		scope_best = os.path.join(stats_dir, f"rule_combo_metrics_{slug}_best_per_neuron.csv")
+		df_all_out.to_csv(scope_all, index=False)
+		df_best.to_csv(scope_best, index=False)
+		print(f"[RuleMetrics] Wrote {scope_all}")
+		print(f"[RuleMetrics] Wrote {scope_best}")
+
+		# Legacy filenames remain TEST-only for backward compatibility.
+		if scope == "test":
+			legacy_all = os.path.join(stats_dir, "rule_combo_metrics_all.csv")
+			legacy_best = os.path.join(stats_dir, "rule_combo_metrics_best_per_neuron.csv")
+			df_all_out.to_csv(legacy_all, index=False)
+			df_best.to_csv(legacy_best, index=False)
+			print(f"[RuleMetrics] Wrote {legacy_all}")
+			print(f"[RuleMetrics] Wrote {legacy_best}")
+
+		if topk is not None and int(topk) > 0:
+			df_top = df_best.sort_values([metric_col, "MCC"], ascending=False, na_position="last").head(int(topk)).copy()
+		else:
+			df_top = df_best.copy()
+		top_name = f"rule_combo_metrics_{slug}_top_{int(topk) if topk else 'all'}.csv"
+		csv_top = os.path.join(stats_dir, top_name)
+		df_top.to_csv(csv_top, index=False)
+		print(f"[RuleMetrics] Wrote {csv_top}")
+		if scope == "test":
+			legacy_top = os.path.join(stats_dir, f"rule_combo_metrics_top_{int(topk) if topk else 'all'}.csv")
+			df_top.to_csv(legacy_top, index=False)
+			print(f"[RuleMetrics] Wrote {legacy_top}")
+
+		high = df_best[pd.to_numeric(df_best[metric_col], errors="coerce") >= float(thr)]
+		summary = {
+			"score_scope": scope,
+			"n_rule_combo_files": int(len(df_scope)),
+			"n_rule_combo_files_all_scopes_before_coverage_filter": int(n_rule_rows_before_coverage_filter),
+			"n_rule_combo_files_all_scopes_after_coverage_filter": int(n_rule_rows_after_coverage_filter),
+			"min_dataset_coverage": float(min_dataset_coverage),
+			"n_rule_combo_files_removed_by_coverage_filter": int(n_rule_rows_before_coverage_filter - n_rule_rows_after_coverage_filter),
+			"n_neurons_with_rules": int(len(df_best)),
+			"quality_metric": str(metric_key),
+			"quality_metric_label": str(metric_label),
+			"quality_threshold": float(thr),
+			"n_neurons_quality_ge_threshold": int(len(high)),
+			"frac_neurons_quality_ge_threshold": (float(len(high)) / float(len(df_best))) if len(df_best) else float("nan"),
+			"quantiles": [float(q_lo), float(q_med), float(q_hi)],
+			metric_col: _q(df_best[metric_col]) if metric_col in df_best.columns else {"n": 0},
+			"MCC": _q(df_best["MCC"]),
+			"F1": _q(df_best["F1"]),
+			"TPR": _q(df_best["TPR"]),
+			"TNR": _q(df_best["TNR"]),
+			"BalancedAcc": _q(df_best["BalancedAcc"]) if "BalancedAcc" in df_best.columns else {"n": 0},
+			"rule_len_atoms": _q(df_best["rule_len_atoms"]),
+			"dataset_coverage": _q(df_best["dataset_coverage"]),
+		}
+		for extra_col in ["n_eval", "n_pos", "n_neg", "n_fire", "target_prevalence", "rule_fire_rate"]:
+			if extra_col in df_best.columns:
+				summary[extra_col] = _q(df_best[extra_col])
+
+		json_path = os.path.join(stats_dir, f"rule_metrics_summary_{slug}.json")
+		Path(json_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+		print(f"[RuleMetrics] Wrote {json_path}")
+		if scope == "test":
+			legacy_json = os.path.join(stats_dir, "rule_metrics_summary.json")
+			Path(legacy_json).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+			print(f"[RuleMetrics] Wrote {legacy_json}")
+
+		tex_suffix = re.sub(r"[^0-9A-Za-z]+", "", str(stats_dirname))
+		tex_suffix = tex_suffix if tex_suffix else "Run"
+		scope_suffix = "" if scope == "test" else re.sub(r"[^0-9A-Za-z]+", "", slug.title())
+
+		tex_lines = []
+		tex_lines.append(f"% Auto-generated by 7_refine_neuron_anchored_rules (rule metrics, score_scope={scope})")
+		tex_lines.append(f"\\newcommand\\RuleQualMetric{tex_suffix}{scope_suffix}{{{metric_label}}}")
+		tex_lines.append(f"\\newcommand\\RuleQualThr{tex_suffix}{scope_suffix}{{{_fmt_float(thr,2)}}}")
+		tex_lines.append(f"\\newcommand\\RuleNeurons{tex_suffix}{scope_suffix}{{{int(summary['n_neurons_with_rules'])}}}")
+		tex_lines.append(f"\\newcommand\\RuleNeuronsHighQual{tex_suffix}{scope_suffix}{{{int(summary['n_neurons_quality_ge_threshold'])}}}")
+		tex_lines.append(f"\\newcommand\\RuleNeuronsHighQualPct{tex_suffix}{scope_suffix}{{{_pct(summary['frac_neurons_quality_ge_threshold'])}}}")
+		for key, macro in [("MCC","RuleMCC"), ("TPR","RuleTPR"), ("TNR","RuleTNR"), ("F1","RuleF1"), ("rule_len_atoms","RuleLen")]:
+			st = summary.get(key, {})
+			tex_lines.append(f"\\newcommand\\{macro}Med{tex_suffix}{scope_suffix}{{{_fmt_float(st.get('median', float('nan')),3)}}}")
+			tex_lines.append(f"\\newcommand\\{macro}Qlo{tex_suffix}{scope_suffix}{{{_fmt_float(st.get('q_lo', float('nan')),3)}}}")
+			tex_lines.append(f"\\newcommand\\{macro}Qhi{tex_suffix}{scope_suffix}{{{_fmt_float(st.get('q_hi', float('nan')),3)}}}")
+		tex_path = os.path.join(stats_dir, f"rule_metrics_{slug}.tex")
+		Path(tex_path).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
+		print(f"[RuleMetrics] Wrote {tex_path}")
+		if scope == "test":
+			legacy_tex = os.path.join(stats_dir, "rule_metrics.tex")
+			Path(legacy_tex).write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
+			print(f"[RuleMetrics] Wrote {legacy_tex}")
+
+		plt.figure(figsize=(12, 7))
+
+		def _hist_col(col: str, xlabel: str, title: str, pos: int):
+			plt.subplot(2, 3, pos)
+			if col in df_best.columns:
+				v = pd.to_numeric(df_best[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
+				plt.hist(v, bins=30)
+			else:
+				plt.hist([], bins=10)
+			plt.xlabel(xlabel)
+			plt.ylabel("# neurons")
+			plt.title(title)
+
+		_hist_col("MCC", "MCC", f"Rule quality (MCC; {scope})", 1)
+		_hist_col("F1", "F1", "Rule quality (F1)", 2)
+		_hist_col("BalancedAcc", "Balanced accuracy", "Rule quality (Balanced accuracy)", 3)
+		_hist_col("TPR", "Sensitivity (TPR)", "Rule quality (Sensitivity)", 4)
+		_hist_col("TNR", "Specificity (TNR)", "Rule quality (Specificity)", 5)
+
+		plt.subplot(2, 3, 6)
+		lens = pd.to_numeric(df_best["rule_len_atoms"], errors="coerce").dropna().to_numpy()
+		if len(lens):
+			max_x = max(1, int(min(np.max(lens), int(length_cap))))
+			plt.hist(np.clip(lens, 0, max_x), bins=min(30, max_x))
+			plt.xlim(0, max_x)
 		else:
 			plt.hist([], bins=10)
-		plt.xlabel(xlabel)
+		plt.xlabel("# atomic conditions (clipped)")
 		plt.ylabel("# neurons")
-		plt.title(title)
+		plt.title("Rule length")
 
-	_hist_col("MCC", "MCC", "Rule quality (MCC)", 1)
-	_hist_col("F1", "F1", "Rule quality (F1)", 2)
-	_hist_col("BalancedAcc", "Balanced accuracy", "Rule quality (Balanced accuracy)", 3)
-	_hist_col("TPR", "Sensitivity (TPR)", "Rule quality (Sensitivity)", 4)
-	_hist_col("TNR", "Specificity (TNR)", "Rule quality (Specificity)", 5)
+		plt.tight_layout()
+		plot_path = os.path.join(stats_dir, f"rule_metrics_distributions_{slug}.pdf")
+		plt.savefig(plot_path, dpi=250, bbox_inches='tight')
+		plt.close()
+		print(f"[RuleMetrics] Wrote {plot_path}")
+		if scope == "test":
+			legacy_plot = os.path.join(stats_dir, "rule_metrics_distributions.pdf")
+			import shutil as _shutil
+			_shutil.copyfile(plot_path, legacy_plot)
+			print(f"[RuleMetrics] Wrote {legacy_plot}")
 
-	plt.subplot(2, 3, 6)
-	lens = pd.to_numeric(df_best["rule_len_atoms"], errors="coerce").dropna().to_numpy()
-	if len(lens):
-		max_x = max(1, int(min(np.max(lens), int(length_cap))))
-		plt.hist(np.clip(lens, 0, max_x), bins=min(30, max_x))
-		plt.xlim(0, max_x)
-	else:
-		plt.hist([], bins=10)
-	plt.xlabel("# atomic conditions (clipped)")
-	plt.ylabel("# neurons")
-	plt.title("Rule length")
+		return df_best
 
-	plt.tight_layout()
-	plot_path = os.path.join(out_dir, 'stats', stats_dirname, f"rule_metrics_distributions.pdf")
-	plt.savefig(plot_path, dpi=250, bbox_inches='tight')
-	plt.close()
-	print(f"[RuleMetrics] Wrote {plot_path}")
-	
-	return df_best
+	df_best_test = _summarize_scope("test")
+	_summarize_scope("all_fit")
+	return df_best_test
 
 def _union_sum_eval_mask(scores_df: pd.DataFrame, cols):
 	"""Return the unique flip mask, summed per-neuron count, and evaluated-row mask."""
@@ -2153,6 +2386,7 @@ def write_high_quality_neuron_flip_coverage(
 	# Backward-compat default; if quality_threshold is None we fall back to this.
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	baseline_metric_col: str = None,
 ):
 	'''
@@ -2167,8 +2401,9 @@ def write_high_quality_neuron_flip_coverage(
 		return None
 	# Ensure rule_best_df only contains rules for these neurons + compatible targets
 	rule_best_df = _filter_rule_metrics_df(rule_best_df, neurons_sorted)
+	rule_best_df = _filter_by_min_dataset_coverage(rule_best_df, min_dataset_coverage)
 	if rule_best_df is None or rule_best_df.empty:
-		print("[HighQuality] No rule metrics available after filtering; skipping.")
+		print(f"[HighQuality] No rule metrics available after filtering and dataset_coverage >= {float(min_dataset_coverage):.6g}; skipping.")
 		return None
 
 	out_dir = str(out_dir)
@@ -2284,6 +2519,7 @@ def write_high_quality_neuron_flip_coverage(
 		"quality_metric": str(metric_key),
 		"quality_metric_label": str(metric_label),
 		"quality_threshold": float(thr),
+		"min_dataset_coverage": float(min_dataset_coverage),
 		# Keep legacy field for backward compatibility.
 		"n_neurons_total": int(len(total_neurons)),
 		"n_neurons_high_quality": int(len(high_neurons)),
@@ -2717,6 +2953,7 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 	stats_dirname: str = "",
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 ):
 	"""
 	Produces a figure analogous to `high_quality_neuron_flip_coverage.pdf` but stratified by layer.
@@ -2735,8 +2972,9 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 		return None
 	# Ensure rule_best_df only contains rules for these neurons + compatible targets
 	rule_best_df = _filter_rule_metrics_df(rule_best_df, neurons_sorted)
+	rule_best_df = _filter_by_min_dataset_coverage(rule_best_df, min_dataset_coverage)
 	if rule_best_df is None or rule_best_df.empty:
-		print("[HighQualityByLayer] No rule metrics available after filtering; skipping.")
+		print(f"[HighQualityByLayer] No rule metrics available after filtering and dataset_coverage >= {float(min_dataset_coverage):.6g}; skipping.")
 		return None
 
 	out_dir = str(out_dir)
@@ -2823,6 +3061,7 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 		"quality_metric": str(metric_key),
 		"quality_metric_label": str(metric_label),
 		"quality_threshold": float(thr),
+		"min_dataset_coverage": float(min_dataset_coverage),
 		"layers": rows,
 	}
 	json_path = os.path.join(stats_dir, "high_quality_neuron_flip_coverage_by_layer.json")
@@ -2898,6 +3137,708 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 
 	return out
 
+
+
+def _score_scope_slug(scope: str) -> str:
+	return str(scope).strip().lower().replace("+", "_").replace("-", "_").replace(" ", "_")
+
+def _load_scope_best_rule_metrics(
+	rules_dir: str,
+	stats_dirname: str,
+	scope: str,
+	scores_df: pd.DataFrame = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+	quality_metric: str = "mcc",
+) -> pd.DataFrame:
+	"""Load best-per-neuron metrics for a score scope.
+
+	For ALL-FIT, never trust a cached best file first: it may be stale from an
+	earlier merge/fallback implementation.  Rebuild the pooled scope from raw
+	cached TRAIN and TEST rule_combo CSVs when available, without re-running any
+	RuleSHAP transforms or model evaluations.  Cached ALL-FIT files are used
+	only as a last-resort fallback.
+	"""
+	stats_dir = Path(rules_dir) / "stats" / str(stats_dirname or "")
+	scope_norm = "all_fit" if str(scope).strip().lower().replace("_", "+").replace("-", "+") in ("all+fit", "allfit", "final+all+fit", "finalfit") else ("all_fit" if str(scope).strip().lower().replace("_", "+") in ("all_fit", "traintest", "all") else "test")
+	metric_key = _norm_rule_metric_name(quality_metric)
+	metric_col = _rule_metric_col(metric_key)
+	if scope_norm == "all_fit":
+		try:
+			raw = collect_rule_combo_metrics(rules_dir)
+		except Exception as exc:
+			print(f"[HighQualityScopes] Could not collect raw rule_combo CSVs for ALL-FIT: {exc}")
+			raw = pd.DataFrame()
+		if raw is not None and not raw.empty and "computed_on" in raw.columns:
+			vals = raw["computed_on"].astype(str).str.strip().str.lower().str.replace("-", "_", regex=False)
+			df = raw[vals.isin(["all_fit", "allfit", "final_all_fit", "finalfit"])].copy()
+			df = _filter_by_min_dataset_coverage(df, min_dataset_coverage)
+			if not df.empty:
+				for c in [metric_col, "MCC", "F1", "BalancedAcc"]:
+					if c in df.columns:
+						df[c] = pd.to_numeric(df[c], errors="coerce")
+				sort_cols = [c for c in [metric_col, "MCC", "F1", "BalancedAcc"] if c in df.columns]
+				if sort_cols:
+					df = df.sort_values(sort_cols, ascending=[False]*len(sort_cols), na_position="last")
+				key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
+				if not key_cols:
+					key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
+				if key_cols:
+					df = df.drop_duplicates(subset=key_cols, keep="first")
+				return df.reset_index(drop=True)
+
+	# TEST can use cached TEST best files.  ALL-FIT must be rebuilt from raw
+	# ALL-FIT component scopes above; if that failed, fail closed instead of
+	# trusting a stale cached all_fit summary.
+	if scope_norm == "all_fit":
+		print("[HighQualityScopes] ALL-FIT unavailable: raw rule_combo_all_fit_* rows were not found/recoverable.")
+		return pd.DataFrame()
+	slug = _score_scope_slug(scope)
+	candidates = [stats_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv", stats_dir / "rule_combo_metrics_best_per_neuron.csv"]
+	for path in candidates:
+		if path.exists():
+			try:
+				return pd.read_csv(path, low_memory=False)
+			except Exception as exc:
+				print(f"[HighQualityScopes] Could not read {path}: {exc}")
+	return pd.DataFrame()
+
+
+def _diagnose_scope_metric_overlap(rule_best_df_test: pd.DataFrame, rule_best_df_all_fit: pd.DataFrame, metric_col: str = "MCC"):
+	"""Print a small sanity check for TEST vs ALL-FIT HQ-source metrics."""
+	if rule_best_df_test is None or rule_best_df_test.empty or rule_best_df_all_fit is None or rule_best_df_all_fit.empty:
+		return
+	keys = [c for c in ["rule_target_dir", "neuron_key"] if c in rule_best_df_test.columns and c in rule_best_df_all_fit.columns]
+	if not keys:
+		keys = [c for c in ["layer_key", "neuron_id"] if c in rule_best_df_test.columns and c in rule_best_df_all_fit.columns]
+	if not keys or metric_col not in rule_best_df_test.columns or metric_col not in rule_best_df_all_fit.columns:
+		return
+	m = rule_best_df_test[keys + [metric_col]].merge(
+		rule_best_df_all_fit[keys + [metric_col]], on=keys, how="inner", suffixes=("_test", "_all_fit")
+	)
+	if m.empty:
+		print("[HighQualityScopes] TEST/ALL-FIT metric diagnostic: no overlapping neurons.")
+		return
+	d = (pd.to_numeric(m[f"{metric_col}_test"], errors="coerce") - pd.to_numeric(m[f"{metric_col}_all_fit"], errors="coerce")).abs()
+	print(
+		f"[HighQualityScopes] TEST/ALL-FIT {metric_col} diagnostic: "
+		f"overlap={len(m)}, changed={(d > 1e-12).sum()}, max_abs_diff={float(d.max(skipna=True)) if len(d) else float('nan'):.6g}"
+	)
+
+def _hq_scope_records(
+	scores_df: pd.DataFrame,
+	neurons_sorted,
+	rule_dfs_by_scope: dict,
+	quality_metric: str,
+	quality_threshold: float,
+	min_dataset_coverage: float,
+	baseline_metric_col: str = None,
+):
+	"""Build all-neuron and scope-specific HQ flip-coverage records.
+
+	The all-neuron causal coverage denominator is independent of the score scope.
+	HQ(TEST) uses train-selected combos scored on held-out TEST rows. HQ(ALL-FIT) uses separate final-fit combos selected and scored on all rows. Flip coverage is evaluated on the corresponding row scope for each score scope.
+	"""
+	if scores_df is None:
+		scores_df = pd.DataFrame()
+	# Stable neuron universe.
+	total_neurons = []
+	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
+		total_neurons.append((_safe_layer_label(layer_label), int(neuron_id)))
+
+	metric_key = _norm_rule_metric_name(quality_metric)
+	metric_col = _rule_metric_col(metric_key)
+	metric_label = _rule_metric_label(metric_key)
+	thr = float(quality_threshold)
+
+	def _cols(neuron_list, prefix):
+		return [f"{prefix}{lk}_{nid}" for (lk, nid) in neuron_list]
+
+	def _coverage_for(neuron_list, sdf=None):
+		# Coverage is evaluated on the row scope supplied by the caller.
+		# TEST HQ should report TEST-row flip prevalence; ALL-FIT HQ should
+		# report pooled all-row prevalence.  The previous implementation always
+		# used the full scores_df for every scope, which made HQ(TEST) and
+		# HQ(ALL-FIT) figures appear identical whenever the HQ neuron set matched.
+		if sdf is None:
+			sdf = scores_df
+		cols_any = _cols(neuron_list, "flip_")
+		cols_c2i = _cols(neuron_list, "flip_c2i_")
+		cols_i2c = _cols(neuron_list, "flip_i2c_")
+		cols_sem = _cols(neuron_list, "flip_semantic_wrong_")
+		union_any_mask, sum_any, eval_any_mask = _union_sum_eval_mask(sdf, cols_any)
+		union_c2i_mask, sum_c2i, _ = _union_sum_eval_mask(sdf, cols_c2i)
+		union_i2c_mask, sum_i2c, _ = _union_sum_eval_mask(sdf, cols_i2c)
+		union_sem_mask, sum_sem, _ = _union_sum_eval_mask(sdf, cols_sem)
+		return {
+			"neurons": list(neuron_list),
+			"cols_any": cols_any,
+			"cols_c2i": cols_c2i,
+			"cols_i2c": cols_i2c,
+			"union_any_mask": union_any_mask,
+			"eval_any_mask": eval_any_mask,
+			"union_any": int(union_any_mask.sum()),
+			"sum_any": int(sum_any),
+			"n_eval_any": int(eval_any_mask.sum()),
+			"union_c2i": int(union_c2i_mask.sum()),
+			"sum_c2i": int(sum_c2i),
+			"union_i2c": int(union_i2c_mask.sum()),
+			"sum_i2c": int(sum_i2c),
+			"union_semantic_wrong": int(union_sem_mask.sum()),
+			"sum_semantic_wrong": int(sum_sem),
+		}
+
+	def _scores_for_scope(scope):
+		if scores_df is None or scores_df.empty:
+			return pd.DataFrame()
+		scope_norm = "all_fit" if str(scope).lower().replace("_", "+").replace("-", "+") in ("all+fit", "allfit", "final+all+fit", "finalfit", "all") else str(scope).lower().replace("_", "+")
+		mask = pd.Series(True, index=scores_df.index)
+		if "is_test" in scores_df.columns:
+			is_test = scores_df["is_test"].fillna(False).astype(bool)
+			if scope_norm == "test":
+				mask &= is_test
+			elif scope_norm == "train":
+				mask &= ~is_test
+		# If the dataframe carries an explicit evaluated-row mask, respect it for every
+		# scope. Fall back to the historical _sampled mask for older artifacts.
+		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else ("_sampled" if "_sampled" in scores_df.columns else None)
+		if mask_col is not None:
+			try:
+				mask &= scores_df[mask_col].fillna(False).astype(bool)
+			except Exception:
+				pass
+		return scores_df.loc[mask].copy()
+
+	all_cov = _coverage_for(total_neurons, scores_df)
+	baseline_denoms = _baseline_direction_denominators(scores_df, baseline_metric_col, all_cov["eval_any_mask"])
+	idx_map = {t: i for i, t in enumerate(total_neurons)}
+
+	def _bool_mat(cols):
+		sub = scores_df.reindex(columns=cols)
+		sub = sub.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+		return (sub.to_numpy() != 0.0)
+
+	def _perm_for(high_neurons, cols, seed):
+		idx_high = [idx_map[t] for t in high_neurons if t in idx_map]
+		if not idx_high:
+			return float("nan")
+		try:
+			return _perm_p_union(_bool_mat(cols), idx_high, n_perm=1000, seed=seed)
+		except Exception:
+			return float("nan")
+
+	scopes = {}
+	for scope, rdf in (rule_dfs_by_scope or {}).items():
+		scope_norm = "all_fit" if str(scope).lower().replace("_", "+").replace("-", "+") in ("all+fit", "allfit", "final+all+fit", "finalfit", "all") else "test"
+		if rdf is None or rdf.empty:
+			continue
+		rdf2 = _filter_rule_metrics_df(rdf.copy(), neurons_sorted)
+		rdf2 = _filter_by_min_dataset_coverage(rdf2, min_dataset_coverage)
+		if rdf2 is None or rdf2.empty:
+			continue
+		mcol = metric_col if metric_col in rdf2.columns else "MCC"
+		if mcol not in rdf2.columns:
+			continue
+		tmp = rdf2.copy()
+		tmp["layer_key"] = tmp["layer_key"].map(_safe_layer_label)
+		high_df = tmp[pd.to_numeric(tmp[mcol], errors="coerce") >= thr]
+		high_ids = {(str(r["layer_key"]), int(r["neuron_id"])) for _, r in high_df.dropna(subset=["neuron_id", "layer_key"]).iterrows()}
+		high_neurons = [t for t in total_neurons if (t[0], t[1]) in high_ids]
+		scope_scores = _scores_for_scope(scope_norm)
+		scope_all_cov = _coverage_for(total_neurons, scope_scores)
+		scope_denoms = _baseline_direction_denominators(scope_scores, baseline_metric_col, scope_all_cov["eval_any_mask"])
+		cov = _coverage_for(high_neurons, scope_scores)
+		cov.update({
+			"score_scope": scope_norm,
+			"score_scope_label": "TEST" if scope_norm == "test" else "ALL-FIT",
+			"n_neurons_high_quality": int(len(high_neurons)),
+			"frac_neurons_high_quality": (float(len(high_neurons)) / float(len(total_neurons))) if total_neurons else float("nan"),
+			"scope_n_rows": int(len(scope_scores)),
+			"scope_all": {k: int(scope_all_cov.get(k, 0) or 0) for k in ["union_any", "sum_any", "n_eval_any", "union_c2i", "sum_c2i", "union_i2c", "sum_i2c", "union_semantic_wrong", "sum_semantic_wrong"]},
+			"eligible_denominators": scope_denoms,
+			"p_union_any": _perm_for(high_neurons, scope_all_cov["cols_any"], 0 if scope_norm == "test" else 10),
+			"p_union_c2i": _perm_for(high_neurons, scope_all_cov["cols_c2i"], 1 if scope_norm == "test" else 11),
+			"p_union_i2c": _perm_for(high_neurons, scope_all_cov["cols_i2c"], 2 if scope_norm == "test" else 12),
+		})
+		scopes[scope_norm] = cov
+
+	return {
+		"quality_metric": str(metric_key),
+		"quality_metric_label": str(metric_label),
+		"quality_threshold": float(thr),
+		"min_dataset_coverage": float(min_dataset_coverage),
+		"total_neurons": total_neurons,
+		"all": all_cov,
+		"baseline_denominators": baseline_denoms,
+		"scopes": scopes,
+	}
+
+def _write_high_quality_scope_tex(scope_rec: dict, out_dir: str, stats_dirname: str):
+	def _pct(x):
+		return int(round(100.0 * float(x))) if x == x else None
+	def _fmtf(x, nd=2):
+		return f"{float(x):.{nd}f}" if x == x else ""
+	def _fmt_p_local(p):
+		if p != p:
+			return ""
+		if p < 1e-4:
+			return "<1e-4"
+		if p < 0.01:
+			return f"{p:.2g}"
+		return f"{p:.2f}"
+
+	stats_dir = Path(out_dir) / "stats" / str(stats_dirname or "")
+	tex_suffix = re.sub(r"[^0-9A-Za-z]+", "", str(stats_dirname)) or "Run"
+	scopes = scope_rec.get("scopes", {})
+	test = scopes.get("test", {})
+	all_fit = scopes.get("all_fit", {})
+	all_cov = scope_rec.get("all", {})
+	lines = []
+	lines.append("% Auto-generated by 7_refine_neuron_anchored_rules (high-quality flip coverage, score scopes)")
+	lines.append(f"\\newcommand\\HighQualMetric{tex_suffix}{{{scope_rec.get('quality_metric_label', 'MCC')}}}")
+	lines.append(f"\\newcommand\\HighQualThr{tex_suffix}{{{_fmtf(scope_rec.get('quality_threshold', float('nan')),2)}}}")
+	lines.append(f"\\newcommand\\HighQualNeurons{tex_suffix}{{{int(test.get('n_neurons_high_quality', 0) or 0)}}}")
+	lines.append(f"\\newcommand\\HighQualNeuronsPct{tex_suffix}{{{_pct(test.get('frac_neurons_high_quality', float('nan')))}}}")
+	lines.append(f"\\newcommand\\HighQualNeuronsAllFit{tex_suffix}{{{int(all_fit.get('n_neurons_high_quality', 0) or 0)}}}")
+	lines.append(f"\\newcommand\\HighQualNeuronsPctAllFit{tex_suffix}{{{_pct(all_fit.get('frac_neurons_high_quality', float('nan')))}}}")
+	lines.append(f"\\newcommand\\HighQualityUnionFlipAny{tex_suffix}{{{int(test.get('union_any', 0) or 0)}}}")
+	lines.append(f"\\newcommand\\HighQualityUnionFlipAnyAllFit{tex_suffix}{{{int(all_fit.get('union_any', 0) or 0)}}}")
+	all_any = float(all_cov.get('union_any', 0) or 0)
+	lines.append(f"\\newcommand\\HighQualityUnionFlipAnyPctAll{tex_suffix}{{{_pct((float(test.get('union_any', 0) or 0) / all_any) if all_any else float('nan'))}}}")
+	lines.append(f"\\newcommand\\HighQualityUnionFlipAnyPctAllAllFit{tex_suffix}{{{_pct((float(all_fit.get('union_any', 0) or 0) / all_any) if all_any else float('nan'))}}}")
+	lines.append(f"\\newcommand\\HighQualityPUnionAny{tex_suffix}{{{_fmt_p_local(test.get('p_union_any', float('nan')))}}}")
+	lines.append(f"\\newcommand\\HighQualityPUnionAnyAllFit{tex_suffix}{{{_fmt_p_local(all_fit.get('p_union_any', float('nan')))}}}")
+	tex_path = stats_dir / "high_quality_neuron_flip_coverage.tex"
+	tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+	print(f"[HighQualityScopes] Wrote {tex_path}")
+
+def write_high_quality_neuron_flip_coverage_with_scopes(
+	scores_df: pd.DataFrame,
+	neurons_sorted,
+	rule_best_df_test: pd.DataFrame,
+	rule_best_df_all_fit: pd.DataFrame,
+	out_dir: str,
+	stats_dirname: str = "",
+	quality_metric: str = "mcc",
+	quality_threshold: float = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+	baseline_metric_col: str = None,
+):
+	"""Write high-quality coverage JSON/PDF with TEST and ALL-FIT HQ subsets.
+
+	Legacy filenames are preserved. If ALL-FIT metrics are unavailable, the plot
+	falls back to TEST-only while still writing a score-scoped JSON structure.
+	"""
+	if rule_best_df_test is None or rule_best_df_test.empty:
+		print("[HighQualityScopes] No TEST rule metrics available; skipping scoped HQ coverage.")
+		return None
+	data = _hq_scope_records(
+		scores_df=scores_df,
+		neurons_sorted=neurons_sorted,
+		rule_dfs_by_scope={"test": rule_best_df_test, "all_fit": rule_best_df_all_fit},
+		quality_metric=quality_metric,
+		quality_threshold=quality_threshold,
+		min_dataset_coverage=min_dataset_coverage,
+		baseline_metric_col=baseline_metric_col,
+	)
+	out_dir = str(out_dir)
+	stats_dir = Path(out_dir) / "stats" / str(stats_dirname or "")
+	stats_dir.mkdir(parents=True, exist_ok=True)
+	all_cov = data["all"]
+	scopes = data["scopes"]
+	baseline_denoms = data.get("baseline_denominators")
+	metric_label = data.get("quality_metric_label", "MCC")
+	thr = float(data.get("quality_threshold", 0.85))
+	total_neurons = data.get("total_neurons", [])
+	# Legacy top-level fields remain TEST semantics. New score_scopes carries both.
+	test = scopes.get("test", {})
+	test_all = test.get("scope_all", {}) if isinstance(test.get("scope_all", {}), dict) else {}
+	test_denoms = test.get("eligible_denominators") if test.get("eligible_denominators") is not None else baseline_denoms
+	summary = {
+		"quality_metric": data.get("quality_metric"),
+		"quality_metric_label": metric_label,
+		"quality_threshold": thr,
+		"min_dataset_coverage": data.get("min_dataset_coverage"),
+		"primary_score_scope": "test",
+		"available_score_scopes": sorted(scopes.keys()),
+		"n_neurons_total": int(len(total_neurons)),
+		"n_neurons_high_quality": int(test.get("n_neurons_high_quality", 0) or 0),
+		"frac_neurons_high_quality": float(test.get("frac_neurons_high_quality", float("nan"))),
+		"baseline_metric_col": str(baseline_metric_col) if baseline_metric_col else None,
+		"eligible_denominators": test_denoms if test_denoms is not None else {
+			"baseline_metric_col": None,
+			"n_eval_baseline_valid": None,
+			"n_eval_baseline_correct": None,
+			"n_eval_baseline_incorrect": None,
+		},
+		"flip_any": {
+			"union_high": int(test.get("union_any", 0) or 0),
+			"sum_high": int(test.get("sum_any", 0) or 0),
+			"union_all": int(test_all.get("union_any", all_cov.get("union_any", 0)) or 0),
+			"sum_all": int(test_all.get("sum_any", all_cov.get("sum_any", 0)) or 0),
+			"union_share_of_all": (float(test.get("union_any", 0) or 0) / float(test_all.get("union_any", all_cov.get("union_any", 0)))) if test_all.get("union_any", all_cov.get("union_any", 0)) else float("nan"),
+			"n_rows_with_any_eval_all": int(test_all.get("n_eval_any", all_cov.get("n_eval_any", 0)) or 0),
+			"n_rows_with_any_eval_high": int(test.get("n_eval_any", 0) or 0),
+		},
+		"score_scopes": {},
+		"figure_semantics": {
+			"hq_test": "High-quality neurons whose frozen train-selected rule combo reaches the threshold on held-out TEST rows; flip prevalence is also evaluated on TEST rows.",
+			"hq_all_fit": "High-quality neurons whose descriptive final-fit combo is selected and scored on all rows; flip prevalence is evaluated on all rows. This is descriptive and not a held-out generalization metric.",
+			"unique_union": "A prompt flipped by several neurons is counted once.",
+		},
+	}
+	for scope, rec in scopes.items():
+		scope_all = rec.get("scope_all", {}) if isinstance(rec.get("scope_all", {}), dict) else {}
+		def _ratio_payload(num, den):
+			return {"numerator": int(num or 0), "denominator": int(den or 0), "percent": (100.0 * float(num or 0) / float(den or 0)) if float(den or 0) else float("nan")}
+		summary["score_scopes"][scope] = {
+			"n_neurons_high_quality": int(rec.get("n_neurons_high_quality", 0) or 0),
+			"frac_neurons_high_quality": float(rec.get("frac_neurons_high_quality", float("nan"))),
+			"scope_n_rows": int(rec.get("scope_n_rows", 0) or 0),
+			"eligible_denominators": rec.get("eligible_denominators"),
+			"all_rule_bearing_in_scope": scope_all,
+			"flip_any": {"union_high": int(rec.get("union_any", 0) or 0), "sum_high": int(rec.get("sum_any", 0) or 0), "union_all_in_scope": int(scope_all.get("union_any", 0) or 0)},
+			"flip_c2i": {"union_high": int(rec.get("union_c2i", 0) or 0), "sum_high": int(rec.get("sum_c2i", 0) or 0), "union_all_in_scope": int(scope_all.get("union_c2i", 0) or 0)},
+			"flip_i2c": {"union_high": int(rec.get("union_i2c", 0) or 0), "sum_high": int(rec.get("sum_i2c", 0) or 0), "union_all_in_scope": int(scope_all.get("union_i2c", 0) or 0)},
+			"ratios": {
+				"prevalence_any": _ratio_payload(rec.get("union_any", 0), (rec.get("eligible_denominators") or {}).get("n_eval_baseline_valid", rec.get("n_eval_any", 0))),
+				"prevalence_c2i": _ratio_payload(rec.get("union_c2i", 0), (rec.get("eligible_denominators") or {}).get("n_eval_baseline_correct", rec.get("n_eval_any", 0))),
+				"prevalence_i2c": _ratio_payload(rec.get("union_i2c", 0), (rec.get("eligible_denominators") or {}).get("n_eval_baseline_incorrect", rec.get("n_eval_any", 0))),
+				"coverage_share_any": _ratio_payload(rec.get("union_any", 0), scope_all.get("union_any", 0)),
+				"coverage_share_c2i": _ratio_payload(rec.get("union_c2i", 0), scope_all.get("union_c2i", 0)),
+				"coverage_share_i2c": _ratio_payload(rec.get("union_i2c", 0), scope_all.get("union_i2c", 0)),
+				"overlap_any": _ratio_payload(rec.get("sum_any", 0), rec.get("union_any", 0)),
+				"overlap_c2i": _ratio_payload(rec.get("sum_c2i", 0), rec.get("union_c2i", 0)),
+				"overlap_i2c": _ratio_payload(rec.get("sum_i2c", 0), rec.get("union_i2c", 0)),
+			},
+			"p_values": {"perm_union_any": float(rec.get("p_union_any", float("nan"))), "perm_union_c2i": float(rec.get("p_union_c2i", float("nan"))), "perm_union_i2c": float(rec.get("p_union_i2c", float("nan")))},
+		}
+	if "test" in scopes and "all_fit" in scopes:
+		test_ids = {tuple(x) for x in scopes["test"].get("neurons", [])}
+		all_fit_ids = {tuple(x) for x in scopes["all_fit"].get("neurons", [])}
+		summary["scope_pair_diagnostics"] = {
+			"n_hq_both": int(len(test_ids & all_fit_ids)),
+			"n_hq_test_only": int(len(test_ids - all_fit_ids)),
+			"n_hq_all_fit_only": int(len(all_fit_ids - test_ids)),
+			"same_hq_neuron_set": bool(test_ids == all_fit_ids),
+		}
+
+	json_path = stats_dir / "high_quality_neuron_flip_coverage.json"
+	json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+	print(f"[HighQualityScopes] Wrote {json_path}")
+	_write_high_quality_scope_tex(data, out_dir, stats_dirname)
+
+	def _fmt_p(p):
+		if p != p:
+			return ""
+		if p < 1e-4:
+			return "<1e-4"
+		if p < 0.01:
+			return f"{p:.2g}"
+		return f"{p:.2f}"
+	def _rate(num, den):
+		return (100.0 * float(num) / float(den)) if den else float("nan")
+	def _ratio(num, den):
+		return (float(num) / float(den)) if den else float("nan")
+	def _fmt_ratio_count(num, den):
+		try:
+			n = int(round(float(num)))
+			d = int(round(float(den)))
+		except Exception:
+			return ""
+		return f"{n}/{d}" if d else f"{n}/0"
+	def _scope_label(scope):
+		return "HQ TEST" if scope == "test" else "HQ ALL-FIT"
+
+	scope_order = [s for s in ["test", "all_fit"] if s in scopes]
+	def _denoms_for(cov_rec, denom_rec):
+		eval_denom_local = float(cov_rec.get("n_eval_any", 0) or 0)
+		has_local = denom_rec is not None
+		return np.asarray([
+			eval_denom_local,
+			float(denom_rec.get("n_eval_baseline_correct")) if has_local and denom_rec.get("n_eval_baseline_correct") is not None else eval_denom_local,
+			float(denom_rec.get("n_eval_baseline_incorrect")) if has_local and denom_rec.get("n_eval_baseline_incorrect") is not None else eval_denom_local,
+		], dtype=float)
+	den_labels = ["eval", "correct", "incorrect"]
+	dir_tick_labels = ["Any flip", "Correct→\nincorrect", "Incorrect→\ncorrect"]
+	x = np.arange(3)
+
+	with plt.rc_context({"font.size": 8, "axes.titlesize": 9, "axes.labelsize": 8, "xtick.labelsize": 7.2, "ytick.labelsize": 7.2, "legend.fontsize": 6.8}):
+		fig, axes = plt.subplots(2, 2, figsize=(9.1, 6.2), constrained_layout=False)
+		fig.subplots_adjust(left=0.075, right=0.995, bottom=0.12, top=0.955, wspace=0.32, hspace=0.44)
+		ax_counts, ax_prev = axes[0]
+		ax_cov, ax_overlap = axes[1]
+		colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None, None])
+		# Counts.
+		count_labels = ["All\nrule-bearing"] + [_scope_label(s).replace(" ", "\n") + f"\n({metric_label}≥{thr:.2f})" for s in scope_order]
+		counts = [len(total_neurons)] + [int(scopes[s].get("n_neurons_high_quality", 0) or 0) for s in scope_order]
+		bars = ax_counts.bar(np.arange(len(counts)), counts, width=0.62, color=colors[:len(counts)])
+		ax_counts.set_xticks(np.arange(len(counts)))
+		ax_counts.set_xticklabels(count_labels)
+		ax_counts.set_ylabel("# neurons")
+		ax_counts.set_title("Subset size", pad=4)
+		ax_counts.set_ylim(0, max(1.0, max(counts) * 1.25 if counts else 1.0))
+		ax_counts.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		for i, b in enumerate(bars):
+			h = b.get_height()
+			pct = (100.0 * h / float(len(total_neurons))) if i > 0 and total_neurons else float("nan")
+			lab = f"{int(h)}" + (f"\n({pct:.1f}%)" if i > 0 and pct == pct else "")
+			ax_counts.annotate(lab, (b.get_x() + b.get_width()/2, h), ha="center", va="bottom", fontsize=7.0, xytext=(0,2), textcoords="offset points")
+
+		# Prevalence. Each scope is evaluated on its own row universe:
+		# All = pooled rows; HQ TEST = held-out TEST rows; HQ ALL-FIT = pooled rows.
+		all_union = np.asarray([all_cov.get("union_any", 0), all_cov.get("union_c2i", 0), all_cov.get("union_i2c", 0)], dtype=float)
+		series = [("All", all_union, _denoms_for(all_cov, baseline_denoms), colors[0])]
+		for idx, scope in enumerate(scope_order, start=1):
+			rec = scopes[scope]
+			rec_denoms = _denoms_for(rec, rec.get("eligible_denominators"))
+			series.append((_scope_label(scope), np.asarray([rec.get("union_any", 0), rec.get("union_c2i", 0), rec.get("union_i2c", 0)], dtype=float), rec_denoms, colors[idx]))
+		w = min(0.24, 0.78 / max(1, len(series)))
+		for idx, (lab, vals, local_denoms, color) in enumerate(series):
+			off = (idx - (len(series)-1)/2) * w
+			pct = np.divide(100.0 * vals, local_denoms, out=np.full(3, np.nan), where=local_denoms > 0)
+			bars_s = ax_prev.bar(x + off, pct, width=w, label=lab, color=color)
+			for b, cnt, den, dl in zip(bars_s, vals, local_denoms, den_labels):
+				if b.get_height() == b.get_height():
+					label = f"{b.get_height():.1f}%\n{_fmt_ratio_count(cnt, den)}"
+					ax_prev.annotate(label, (b.get_x()+b.get_width()/2, b.get_height()), ha="center", va="bottom", fontsize=5.2, xytext=(0,1), textcoords="offset points", rotation=0, linespacing=0.9)
+		ax_prev.set_xticks(x)
+		ax_prev.set_xticklabels(dir_tick_labels)
+		ax_prev.set_ylabel("Unique flips / eligible points (%)")
+		ax_prev.set_title("Eligible flip prevalence", pad=4)
+		prev_vals = []
+		for _, vals, local_denoms, _ in series:
+			prev_vals.extend(list(np.divide(100.0 * vals, local_denoms, out=np.full(3, np.nan), where=local_denoms > 0)))
+		prev_top = np.nanmax(prev_vals) if len(prev_vals) and np.isfinite(prev_vals).any() else 1.0
+		ax_prev.set_ylim(0, max(1.0, float(prev_top) * 1.34))
+		ax_prev.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		ax_prev.legend(loc="upper right", frameon=False, ncol=1, handlelength=1.0, borderpad=0.1)
+
+		# Coverage share. Compare each HQ scope against all rule-bearing neurons
+		# evaluated on the same row scope.
+		cov_series = []
+		for idx, scope in enumerate(scope_order, start=1):
+			rec = scopes[scope]
+			scope_all = rec.get("scope_all", {}) if isinstance(rec.get("scope_all", {}), dict) else all_cov
+			vals = np.asarray([
+				_ratio(rec.get("union_any", 0), scope_all.get("union_any", 0)),
+				_ratio(rec.get("union_c2i", 0), scope_all.get("union_c2i", 0)),
+				_ratio(rec.get("union_i2c", 0), scope_all.get("union_i2c", 0)),
+			], dtype=float) * 100.0
+			cov_counts = np.asarray([
+				[rec.get("union_any", 0), scope_all.get("union_any", 0)],
+				[rec.get("union_c2i", 0), scope_all.get("union_c2i", 0)],
+				[rec.get("union_i2c", 0), scope_all.get("union_i2c", 0)],
+			], dtype=float)
+			cov_series.append((scope, vals, cov_counts, colors[idx]))
+		w2 = min(0.30, 0.70 / max(1, len(cov_series)))
+		for idx, (scope, vals, cov_counts, color) in enumerate(cov_series):
+			off = (idx - (len(cov_series)-1)/2) * w2
+			bars_s = ax_cov.bar(x + off, vals, width=w2, label=_scope_label(scope), color=color)
+			for b, pct, pair in zip(bars_s, vals, cov_counts):
+				if pct == pct:
+					label = f"{pct:.0f}%\n{_fmt_ratio_count(pair[0], pair[1])}"
+					ax_cov.annotate(label, (b.get_x()+b.get_width()/2, b.get_height()), ha="center", va="bottom", fontsize=5.4, xytext=(0,1), textcoords="offset points", linespacing=0.9)
+		ax_cov.set_xticks(x)
+		ax_cov.set_xticklabels(dir_tick_labels)
+		ax_cov.set_ylabel("HQ / all union (%)")
+		ax_cov.set_title("Coverage share", pad=4)
+		cov_top = np.nanmax([v for _, vals, _, _ in cov_series for v in vals]) if cov_series else 100.0
+		ax_cov.set_ylim(0, max(100.0, float(cov_top) * 1.12 if cov_top == cov_top else 100.0))
+		ax_cov.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		ax_cov.legend(loc="upper right", frameon=False, ncol=1, handlelength=1.0, borderpad=0.1)
+
+		# Overlap / redundancy.
+		overlap_series = [(
+			"All",
+			np.asarray([_ratio(all_cov.get("sum_any", 0), all_cov.get("union_any", 0)), _ratio(all_cov.get("sum_c2i", 0), all_cov.get("union_c2i", 0)), _ratio(all_cov.get("sum_i2c", 0), all_cov.get("union_i2c", 0))], dtype=float),
+			np.asarray([[all_cov.get("sum_any", 0), all_cov.get("union_any", 0)], [all_cov.get("sum_c2i", 0), all_cov.get("union_c2i", 0)], [all_cov.get("sum_i2c", 0), all_cov.get("union_i2c", 0)]], dtype=float),
+			colors[0],
+		)]
+		for idx, scope in enumerate(scope_order, start=1):
+			rec = scopes[scope]
+			overlap_vals = np.asarray([_ratio(rec.get("sum_any", 0), rec.get("union_any", 0)), _ratio(rec.get("sum_c2i", 0), rec.get("union_c2i", 0)), _ratio(rec.get("sum_i2c", 0), rec.get("union_i2c", 0))], dtype=float)
+			overlap_counts = np.asarray([[rec.get("sum_any", 0), rec.get("union_any", 0)], [rec.get("sum_c2i", 0), rec.get("union_c2i", 0)], [rec.get("sum_i2c", 0), rec.get("union_i2c", 0)]], dtype=float)
+			overlap_series.append((_scope_label(scope), overlap_vals, overlap_counts, colors[idx]))
+		w3 = min(0.24, 0.78 / max(1, len(overlap_series)))
+		for idx, (lab, vals, counts_ratio, color) in enumerate(overlap_series):
+			off = (idx - (len(overlap_series)-1)/2) * w3
+			bars_s = ax_overlap.bar(x + off, vals, width=w3, label=lab, color=color)
+			for b, val, pair in zip(bars_s, vals, counts_ratio):
+				if val == val:
+					label = f"{val:.1f}\n{_fmt_ratio_count(pair[0], pair[1])}"
+					ax_overlap.annotate(label, (b.get_x()+b.get_width()/2, b.get_height()), ha="center", va="bottom", fontsize=5.0, xytext=(0,1), textcoords="offset points", linespacing=0.85)
+		ax_overlap.axhline(1.0, linewidth=0.8, alpha=0.45)
+		ax_overlap.set_xticks(x)
+		ax_overlap.set_xticklabels(dir_tick_labels)
+		ax_overlap.set_ylabel("Sum / union")
+		ax_overlap.set_title("Overlap", pad=4)
+		overlap_vals = [v for _, vals, _, _ in overlap_series for v in vals if v == v]
+		ax_overlap.set_ylim(0, max(1.0, max(overlap_vals) * 1.25 if overlap_vals else 1.0))
+		ax_overlap.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.4)
+		ax_overlap.legend(loc="upper right", frameon=False, ncol=1, handlelength=1.0, borderpad=0.1)
+		for ax in [ax_counts, ax_prev, ax_cov, ax_overlap]:
+			ax.spines["top"].set_visible(False)
+			ax.spines["right"].set_visible(False)
+		plot_path = stats_dir / "high_quality_neuron_flip_coverage.pdf"
+		fig.savefig(plot_path, dpi=300, bbox_inches="tight", pad_inches=0.02)
+		plt.close(fig)
+		print(f"[HighQualityScopes] Wrote {plot_path}")
+	return summary
+
+def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
+	scores_df: pd.DataFrame,
+	neurons_sorted,
+	rule_best_df_test: pd.DataFrame,
+	rule_best_df_all_fit: pd.DataFrame,
+	out_dir: str,
+	stats_dirname: str = "",
+	quality_metric: str = "mcc",
+	quality_threshold: float = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+):
+	if rule_best_df_test is None or rule_best_df_test.empty:
+		print("[HighQualityByLayerScopes] No TEST rule metrics available; skipping.")
+		return None
+	data = _hq_scope_records(
+		scores_df=scores_df,
+		neurons_sorted=neurons_sorted,
+		rule_dfs_by_scope={"test": rule_best_df_test, "all_fit": rule_best_df_all_fit},
+		quality_metric=quality_metric,
+		quality_threshold=quality_threshold,
+		min_dataset_coverage=min_dataset_coverage,
+		baseline_metric_col=None,
+	)
+	out_dir = str(out_dir)
+	stats_dir = Path(out_dir) / "stats" / str(stats_dirname or "")
+	stats_dir.mkdir(parents=True, exist_ok=True)
+	scopes = data.get("scopes", {})
+	metric_label = data.get("quality_metric_label", "MCC")
+	thr = float(data.get("quality_threshold", 0.85))
+	# High ids by scope.
+	high_ids_by_scope = {scope: set(rec.get("neurons", [])) for scope, rec in scopes.items()}
+	layer_to_neurons = defaultdict(list)
+	for layer_label, neuron_id, _ in unique_everseen(neurons_sorted, key=lambda x: (x[0], x[1])):
+		layer_to_neurons[_safe_layer_label(layer_label)].append(int(neuron_id))
+	layers = sorted(layer_to_neurons.keys(), key=lambda lk: _layer_sort_key(lk))
+	def _cols(neuron_list, prefix):
+		return [f"{prefix}{lkey}_{nid}" for (lkey, nid) in neuron_list]
+	def _scores_for_scope_layer(scope):
+		if scores_df is None or scores_df.empty:
+			return pd.DataFrame()
+		scope_norm = "all_fit" if str(scope).lower().replace("_", "+").replace("-", "+") in ("all+fit", "allfit", "final+all+fit", "finalfit", "all") else str(scope).lower().replace("_", "+")
+		mask = pd.Series(True, index=scores_df.index)
+		if "is_test" in scores_df.columns:
+			is_test = scores_df["is_test"].fillna(False).astype(bool)
+			if scope_norm == "test":
+				mask &= is_test
+			elif scope_norm == "train":
+				mask &= ~is_test
+		mask_col = "_evaluated" if "_evaluated" in scores_df.columns else ("_sampled" if "_sampled" in scores_df.columns else None)
+		if mask_col is not None:
+			try:
+				mask &= scores_df[mask_col].fillna(False).astype(bool)
+			except Exception:
+				pass
+		return scores_df.loc[mask].copy()
+	rows = []
+	for lk in layers:
+		nids = sorted(set(layer_to_neurons[lk]))
+		all_neus = [(lk, nid) for nid in nids]
+		cols_c2i_all = _cols(all_neus, "flip_c2i_")
+		cols_i2c_all = _cols(all_neus, "flip_i2c_")
+		cols_any_all = _cols(all_neus, "flip_")
+		union_any_all, _, n_eval_any_all = _union_and_sum_flips(scores_df, cols_any_all)
+		union_c2i_all, _, _ = _union_and_sum_flips(scores_df, cols_c2i_all)
+		union_i2c_all, _, _ = _union_and_sum_flips(scores_df, cols_i2c_all)
+		row = {
+			"layer_key": lk,
+			"layer_sort": int(_layer_sort_key(lk)),
+			"n_neurons_total": int(len(all_neus)),
+			"n_rows_with_any_eval_all": int(n_eval_any_all),
+			"flip_any_union_all": int(union_any_all),
+			"flip_c2i_union_all": int(union_c2i_all),
+			"flip_i2c_union_all": int(union_i2c_all),
+		}
+		for scope in ["test", "all_fit"]:
+			slug = _score_scope_slug(scope)
+			sdf_scope = _scores_for_scope_layer(scope)
+			hq_neus = [t for t in all_neus if t in high_ids_by_scope.get(scope, set())]
+			cols_any_hq = _cols(hq_neus, "flip_")
+			cols_c2i_hq = _cols(hq_neus, "flip_c2i_")
+			cols_i2c_hq = _cols(hq_neus, "flip_i2c_")
+			union_any_hq, _, n_eval_any_hq = _union_and_sum_flips(sdf_scope, cols_any_hq)
+			union_c2i_hq, _, _ = _union_and_sum_flips(sdf_scope, cols_c2i_hq)
+			union_i2c_hq, _, _ = _union_and_sum_flips(sdf_scope, cols_i2c_hq)
+			row[f"n_neurons_high_quality_{slug}"] = int(len(hq_neus))
+			row[f"n_rows_with_any_eval_high_{slug}"] = int(n_eval_any_hq)
+			row[f"flip_any_union_high_{slug}"] = int(union_any_hq)
+			row[f"flip_c2i_union_high_{slug}"] = int(union_c2i_hq)
+			row[f"flip_i2c_union_high_{slug}"] = int(union_i2c_hq)
+		# Legacy TEST fields.
+		row["n_neurons_high_quality"] = row.get("n_neurons_high_quality_test", 0)
+		row["n_rows_with_any_eval_high"] = row.get("n_rows_with_any_eval_high_test", 0)
+		row["flip_any_union_high"] = row.get("flip_any_union_high_test", 0)
+		row["flip_c2i_union_high"] = row.get("flip_c2i_union_high_test", 0)
+		row["flip_i2c_union_high"] = row.get("flip_i2c_union_high_test", 0)
+		rows.append(row)
+	out = {
+		"quality_metric": data.get("quality_metric"),
+		"quality_metric_label": metric_label,
+		"quality_threshold": thr,
+		"min_dataset_coverage": data.get("min_dataset_coverage"),
+		"primary_score_scope": "test",
+		"available_score_scopes": sorted(scopes.keys()),
+		"layers": rows,
+	}
+	json_path = stats_dir / "high_quality_neuron_flip_coverage_by_layer.json"
+	json_path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+	print(f"[HighQualityByLayerScopes] Wrote {json_path}")
+
+	df_plot = pd.DataFrame(rows).sort_values("layer_sort")
+	if df_plot.empty:
+		return out
+	layer_labels = [str(x).replace("_", ".") for x in df_plot["layer_key"].tolist()]
+	x = np.arange(len(layer_labels))
+	denom_all = max(1, len(scores_df))
+	denom_by_scope = {"test": max(1, len(_scores_for_scope_layer("test"))), "all_fit": max(1, len(_scores_for_scope_layer("all_fit")))}
+	colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None, None, None, None, None])
+	plt.figure(figsize=(max(10, 0.65 * len(layer_labels)), 6.8))
+	ax1 = plt.subplot(2, 1, 1)
+	w = 0.25
+	ax1.bar(x - w, df_plot["n_neurons_total"].to_numpy(), w, label="All neurons w/ rules", color=colors[0])
+	ax1.bar(x, df_plot.get("n_neurons_high_quality_test", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ TEST ({metric_label} ≥ {thr:.2f})", color=colors[1])
+	ax1.bar(x + w, df_plot.get("n_neurons_high_quality_all_fit", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ ALL-FIT ({metric_label} ≥ {thr:.2f})", color=colors[2])
+	ax1.set_ylabel("# neurons")
+	ax1.set_xticks(x)
+	ax1.set_xticklabels(layer_labels, rotation=45, ha="right")
+	ax1.tick_params(axis="x", labelbottom=False)
+	ax1.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+	ax1.legend(loc="best", fontsize=8, ncol=3)
+	ax2 = plt.subplot(2, 1, 2)
+	c2i_all = 100.0 * df_plot["flip_c2i_union_all"].to_numpy(dtype=float) / denom_all
+	i2c_all = 100.0 * df_plot["flip_i2c_union_all"].to_numpy(dtype=float) / denom_all
+	ax2.plot(x, c2i_all, marker="o", linewidth=1.2, label="c→i all", color=colors[0])
+	ax2.plot(x, i2c_all, marker="s", linewidth=1.2, label="i→c all", color=colors[3] if len(colors)>3 else None)
+	for scope, marker, ls, ci in [("test", "o", "--", 1), ("all_fit", "o", ":", 2)]:
+		label_scope = "TEST" if scope == "test" else "ALL-FIT"
+		c = df_plot.get(f"flip_c2i_union_high_{scope}", pd.Series([0]*len(df_plot))).to_numpy(dtype=float)
+		i = df_plot.get(f"flip_i2c_union_high_{scope}", pd.Series([0]*len(df_plot))).to_numpy(dtype=float)
+		denom_scope = denom_by_scope.get(scope, denom_all)
+		ax2.plot(x, 100.0*c/denom_scope, marker=marker, linestyle=ls, linewidth=1.2, label=f"c→i HQ {label_scope}", color=colors[ci])
+		ax2.plot(x, 100.0*i/denom_scope, marker="s", linestyle=ls, linewidth=1.2, label=f"i→c HQ {label_scope}", color=colors[ci])
+	ax2.set_ylabel("Unique flips (% of ablated prompts)")
+	ax2.set_xlabel("Layer")
+	ax2.set_xticks(x)
+	ax2.set_xticklabels(layer_labels, rotation=45, ha="right")
+	ax2.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+	ax2.legend(loc="best", fontsize=7, ncol=3)
+	plot_path = stats_dir / "high_quality_neuron_flip_coverage_by_layer.pdf"
+	plt.tight_layout()
+	plt.savefig(plot_path, dpi=250, bbox_inches="tight")
+	plt.close()
+	print(f"[HighQualityByLayerScopes] Wrote {plot_path}")
+	return out
+
 def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neurons_sorted, args, stats_dirname: str, baseline_metric_col: str = None):
 	if not getattr(args, "summarize_rule_metrics", False) and not getattr(args, "summarize_rule_metrics_only", False):
 		return None
@@ -2923,29 +3864,48 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 		length_cap=int(getattr(args, "rule_length_cap", 30)),
 		quality_metric=qual_metric,
 		quality_threshold=qual_thr,
+		min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 		neurons_sorted=neurons_sorted,
+		scores_df=scores_df,
 	)
 
 	if rule_best_df is not None:
-		write_high_quality_neuron_flip_coverage(
+		# Load descriptive ALL-FIT best rows selected/scored on all available rows.
+		rule_best_all_fit_df = _load_scope_best_rule_metrics(
+			args.rules_dir,
+			stats_dirname,
+			"all_fit",
+			scores_df=scores_df,
+			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
+			quality_metric=qual_metric,
+		)
+		if rule_best_all_fit_df is None or rule_best_all_fit_df.empty:
+			print("[HighQualityScopes] ALL-FIT best metrics unavailable; figures will show TEST HQ only.")
+		else:
+			_diagnose_scope_metric_overlap(rule_best_df, rule_best_all_fit_df, _rule_metric_col(_norm_rule_metric_name(qual_metric)))
+		write_high_quality_neuron_flip_coverage_with_scopes(
 			scores_df=scores_df,
 			neurons_sorted=neurons_sorted,
-			rule_best_df=rule_best_df,
+			rule_best_df_test=rule_best_df,
+			rule_best_df_all_fit=rule_best_all_fit_df,
 			out_dir=args.rules_dir,
 			stats_dirname=stats_dirname,
 			quality_metric=qual_metric,
 			quality_threshold=qual_thr,
+			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 			baseline_metric_col=baseline_metric_col,
 		)
 
-		write_high_quality_neuron_flip_coverage_by_layer(
+		write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 			scores_df=scores_df,
 			neurons_sorted=neurons_sorted,
-			rule_best_df=rule_best_df,
+			rule_best_df_test=rule_best_df,
+			rule_best_df_all_fit=rule_best_all_fit_df,
 			out_dir=args.rules_dir,
 			stats_dirname=stats_dirname,
 			quality_metric=qual_metric,
 			quality_threshold=qual_thr,
+			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 		)
 
 	return rule_best_df
@@ -3136,16 +4096,45 @@ def main():
 		return
 
 	device = get_device()
-	model = LMWrapper(
-		model_name=ai_model,
-		device=device,
-		eval_mode=True,
-		# ungroup_grouped_query_attention=False,
-		# circuit_discovery=False,
-		cache_dir=args.ai_model_cache_dir,
-	)
-	unhooked_model = getattr(model, "model", None)
-	tokenizer = getattr(model, "tokenizer", None)
+	model = None
+	unhooked_model = None
+	tokenizer = None
+
+	def _ensure_model_loaded():
+		"""Load the target LLM only when a cache miss actually needs it."""
+		nonlocal model, unhooked_model, tokenizer
+		if model is None:
+			print("[Model] Loading target LLM because a cache miss requires generation/representations ...")
+			model = LMWrapper(
+				model_name=ai_model,
+				device=device,
+				eval_mode=True,
+				# ungroup_grouped_query_attention=False,
+				# circuit_discovery=False,
+				cache_dir=args.ai_model_cache_dir,
+			)
+			unhooked_model = getattr(model, "model", None)
+			tokenizer = getattr(model, "tokenizer", None)
+		return model, unhooked_model, tokenizer
+
+	def _release_model():
+		"""Free the target LLM before CPU-only stats/RuleSHAP work."""
+		nonlocal model, unhooked_model, tokenizer
+		if model is None and unhooked_model is None and tokenizer is None:
+			return
+		print("[Model] Releasing target LLM before stats/rule extraction ...")
+		model = None
+		unhooked_model = None
+		tokenizer = None
+		gc.collect()
+		try:
+			import torch as _torch
+			if _torch.cuda.is_available():
+				_torch.cuda.empty_cache()
+			if hasattr(_torch, "mps") and hasattr(_torch.mps, "empty_cache"):
+				_torch.mps.empty_cache()
+		except Exception:
+			pass
 
 	# Discover neurons from per_rule
 	print(f"[1/5] Discovering neurons from {circuit_agonists_path} (max_effect >= {args.search_epsilon}) ...")
@@ -3186,11 +4175,12 @@ def main():
 		spectral_cache_fp = _spectral_cache_path(args)
 
 		def _compute_spectral_sampling():
+			_model, _unhooked_model, _tokenizer = _ensure_model_loaded()
 			emb_all, Z = build_reps_and_embedding_from_args(
 				args=args,
 				texts=all_prompts_full,
-				model=unhooked_model,
-				tokenizer=tokenizer,
+				model=_unhooked_model,
+				tokenizer=_tokenizer,
 				device=device,
 			)
 			Z = np.asarray(Z, dtype=np.float32)
@@ -3294,9 +4284,9 @@ def main():
 		print("[2/5] Spectral sampling disabled; using all prompts.")
 
 	# Decide which datapoints we actually evaluate under ablation.
-	# When spectral sampling is enabled, we evaluate:
-	#   - the sampled rows
-	#   - PLUS all test rows (is_test==True), so df_eval has real flip labels
+	# When spectral sampling is enabled, ablations are run exactly on the sampled rows.
+	# There is no special "force include test rows" path: TEST/ALL-FIT rule scopes are
+	# computed over the rows that are actually present/evaluated in scores_df.
 	if args.use_spectral_sampling:
 		# --- sampled set (dedupe, preserve order) ---
 		seen = set()
@@ -3308,8 +4298,11 @@ def main():
 			keep_pos.append(pos)
 		eval_indices_sampled = sample_indices[np.asarray(keep_pos, dtype=int)]
 
-		# --- force-include ALL test rows ---
+		# --- held-out test rows are not force-included in spectral-sampling eval ---
 		test_indices = np.array([], dtype=int)
+		# If you intentionally want full-test ablation coverage, add an explicit
+		# opt-in flag and enable the two lines below. Keeping this disabled preserves
+		# the spectral-sampling evaluation set used by the run configuration.
 		# if "is_test" in scores_df.columns:
 		# 	test_indices = np.where(scores_df["is_test"].astype(bool).to_numpy())[0].astype(int)
 
@@ -3320,24 +4313,26 @@ def main():
 		eval_prompts = [all_examples_full[i] for i in eval_indices]
 
 		# masks in original-row space
-		sampled_mask = np.zeros(n_points_total, dtype=bool)
-		sampled_mask[eval_indices_sampled] = True
+		spectral_sampled_center_mask = np.zeros(n_points_total, dtype=bool)
+		spectral_sampled_center_mask[eval_indices_sampled] = True
 
 		evaluated_mask = np.zeros(n_points_total, dtype=bool)
 		evaluated_mask[eval_indices] = True
-
-		if test_indices.size:
-			print(f"[Sampling] Added {len(test_indices)} test rows to eval set -> total eval points = {len(eval_indices)}")
+		# Historical downstream code uses _sampled to mean "has evaluated flip targets".
+		# Preserve that meaning.
+		sampled_mask = evaluated_mask.copy()
 
 		if args.keep_unsampled_rows:
 			scores_out = scores_df.copy()
 			scores_out["_sampled"] = sampled_mask
 			scores_out["_evaluated"] = evaluated_mask
+			scores_out["_spectral_sampled_center"] = spectral_sampled_center_mask
 		else:
 			scores_out = scores_df.iloc[eval_indices].copy().reset_index(drop=True)
 			scores_out["_orig_row"] = eval_indices
 			scores_out["_sampled"] = sampled_mask[eval_indices]
 			scores_out["_evaluated"] = True
+			scores_out["_spectral_sampled_center"] = spectral_sampled_center_mask[eval_indices]
 	else:
 		eval_indices = np.arange(n_points_total, dtype=int)
 		eval_prompts = all_examples_full
@@ -3392,8 +4387,9 @@ def main():
 				replacement_cache_fp = _replacement_scores_cache_path(args, replacement_cache_cfg)
 
 				def _compute_replacement_scores():
+					_model, _, _ = _ensure_model_loaded()
 					return precompute_mean_activations(
-						model=model,
+						model=_model,
 						all_prompts=mean_prompt_pool,
 						layer_to_neurons=layer_to_neurons,
 						n_points=args.points_to_use_for_mean_ablation,
@@ -3438,6 +4434,13 @@ def main():
 	def _flip_cache_path(rules_subdir, layer_key, neuron_id, batch_start):
 		return os.path.join(rules_subdir, f"{layer_key}_{int(neuron_id)}_{batch_start}.pkl")
 
+	def _cached_eval_file_exists(cache_path):
+		"""Cheap cache-hit predicate: no pickle load, no answer rescoring, no LLM."""
+		try:
+			return os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0
+		except OSError:
+			return False
+
 	def _coerce_cached_answers(value):
 		if value is None:
 			return None
@@ -3456,7 +4459,7 @@ def main():
 			semantics[k] = arr
 		return semantics
 
-	def _load_cached_eval(cache_path, rows=None, *, score_from_answers=True):
+	def _load_cached_eval(cache_path, rows=None, *, score_from_answers=False):
 		if not os.path.exists(cache_path):
 			return None
 		with open(cache_path, "rb") as f:
@@ -3561,6 +4564,123 @@ def main():
 			_ensure_bool_col(c)
 		return cols
 
+	def _expected_flip_cols_for_neuron(layer_label, neuron_id):
+		layer_key = _safe_layer_label(layer_label)
+		return (
+			f"flip_{layer_key}_{int(neuron_id)}",
+			f"flip_c2i_{layer_key}_{int(neuron_id)}",
+			f"flip_i2c_{layer_key}_{int(neuron_id)}",
+		)
+
+	def _existing_scores_path():
+		stats_dirname = args.stats_dirname if args.stats_dirname is not None else ""
+		return Path(args.rules_dir) / "stats" / str(stats_dirname) / "scores.csv"
+
+	def _load_existing_scores_if_complete():
+		"""Reuse the materialized scores.csv instead of replaying thousands of pkl files."""
+		fp = _existing_scores_path()
+		if not fp.exists():
+			return None
+		try:
+			candidate = pd.read_csv(fp)
+		except Exception as e:
+			print(f"[Cache] Could not read existing materialized scores {fp}: {e}")
+			return None
+		if len(candidate) != len(scores_out):
+			print(f"[Cache] Existing materialized scores row mismatch ({len(candidate)} != {len(scores_out)}); rebuilding from ablation cache.")
+			return None
+		required = []
+		for layer_label, neuron_id, _baseline_subset in neurons:
+			required.extend(_expected_flip_cols_for_neuron(layer_label, neuron_id))
+		missing = [c for c in required if c not in candidate.columns]
+		if missing:
+			print(f"[Cache] Existing materialized scores missing {len(missing)} flip columns; rebuilding from ablation cache.")
+			return None
+		print(f"[Cache] Reusing materialized flip columns from {fp}; skipping ablation cache replay.")
+		return candidate
+
+	def _all_ablation_cache_files_exist(batch_starts):
+		missing = []
+		for start_i in batch_starts:
+			for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
+				layer_key = _safe_layer_label(layer_label)
+				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
+				if not _cached_eval_file_exists(cache_path):
+					missing.append(cache_path)
+					if len(missing) >= 5:
+						return False, missing
+		return True, missing
+
+	def _row_positions_for_eval_batch(start_i, end_i):
+		if args.use_spectral_sampling and args.keep_unsampled_rows:
+			return np.asarray(eval_indices[start_i:end_i], dtype=int)
+		return np.arange(start_i, end_i, dtype=int)
+
+	def _assign_bool_values(storage, positions, values):
+		storage[np.asarray(positions, dtype=int)] = np.asarray(values).astype(bool)
+
+	def _rebuild_scores_from_ablation_cache_only(batch_starts):
+		"""Materialize flip columns from existing pkl files without prefix prefill/generation.
+
+		This is much faster than the normal generation loop on fully cached runs because
+		it writes each dataframe column once instead of doing tiny iloc writes for every
+		(batch, neuron) pair.
+		"""
+		n_rows_out = len(scores_out)
+		for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, _hooks, _cache_policy_tag in tqdm(
+			neuron_specs, desc="Rebuilding cached flip columns"
+		):
+			layer_key = _safe_layer_label(layer_label)
+			col_any, col_c2i, col_i2c = _ensure_flip_cols(layer_key, neuron_id)
+			any_values = np.full(n_rows_out, pd.NA, dtype=object)
+			c2i_values = np.full(n_rows_out, pd.NA, dtype=object)
+			i2c_values = np.full(n_rows_out, pd.NA, dtype=object)
+			semantic_values = {}
+
+			for start_i in batch_starts:
+				end_i = min(start_i + batch_size, len(eval_prompts))
+				batch_prompt_i = eval_prompts[start_i:end_i]
+				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start_i)
+				cached_eval = _load_cached_eval(cache_path, batch_prompt_i, score_from_answers=False)
+				if cached_eval is None:
+					raise RuntimeError(f"Expected cached ablation result missing or invalid: {cache_path}")
+				abl = np.asarray(cached_eval.get("correct", [])).astype(bool)
+				base = np.asarray(baseline_eval[start_i:end_i]).astype(bool)
+				flip_any = (abl != base)
+				positions = _row_positions_for_eval_batch(start_i, end_i)
+				_assign_bool_values(any_values, positions, flip_any)
+				_assign_bool_values(c2i_values, positions, (base == True) & (abl == False))
+				_assign_bool_values(i2c_values, positions, (base == False) & (abl == True))
+
+				semantics = cached_eval.get("semantics", {}) or {}
+				if semantics:
+					cols = _ensure_semantic_cols(layer_key, neuron_id)
+					if not semantic_values:
+						semantic_values = {name: np.full(n_rows_out, pd.NA, dtype=object) for name in cols.values()}
+					zero = np.zeros_like(flip_any, dtype=bool)
+					sem_wrong = np.asarray(semantics.get("answer_semantically_wrong", zero)).astype(bool)
+					sem_correct = np.asarray(semantics.get("answer_semantically_correct", zero)).astype(bool)
+					empty = np.asarray(semantics.get("answer_empty", zero)).astype(bool)
+					unparseable = np.asarray(semantics.get("answer_unparseable", zero)).astype(bool)
+					judge_used = np.asarray(semantics.get("answer_judge_enabled", zero)).astype(bool)
+					judge_parse_success = np.asarray(semantics.get("answer_judge_parse_success", zero)).astype(bool)
+					_assign_bool_values(semantic_values[cols["semantic_wrong"]], positions, sem_wrong)
+					_assign_bool_values(semantic_values[cols["semantic_correct"]], positions, sem_correct)
+					_assign_bool_values(semantic_values[cols["empty"]], positions, empty)
+					_assign_bool_values(semantic_values[cols["unparseable"]], positions, unparseable)
+					_assign_bool_values(semantic_values[cols["judge_used"]], positions, judge_used)
+					_assign_bool_values(semantic_values[cols["judge_parse_success"]], positions, judge_parse_success)
+					_assign_bool_values(semantic_values[cols["flip_semantic_wrong"]], positions, flip_any & sem_wrong)
+					_assign_bool_values(semantic_values[cols["flip_empty"]], positions, flip_any & empty)
+					_assign_bool_values(semantic_values[cols["flip_unparseable"]], positions, flip_any & unparseable)
+
+			scores_out[col_any] = pd.Series(any_values, dtype="boolean")
+			scores_out[col_c2i] = pd.Series(c2i_values, dtype="boolean")
+			scores_out[col_i2c] = pd.Series(i2c_values, dtype="boolean")
+			for col_name, values in semantic_values.items():
+				scores_out[col_name] = pd.Series(values, dtype="boolean")
+		return scores_out
+
 	def _semantic_arrays(rows, answers):
 		if not semantic_diagnostics_enabled:
 			return {}
@@ -3664,6 +4784,7 @@ def main():
 		return acc_by_spec, sem_by_spec, answers_by_spec
 
 	def _compute_rowwise_chunk_decode_only(layer_label, chunk_specs, prefix_batches, batch_ranges, batch_prompt):
+		_model, _, _ = _ensure_model_loaded()
 		K = len(chunk_specs)
 		acc_by_spec, sem_by_spec, answers_by_spec = _empty_eval_store(chunk_specs, len(batch_prompt))
 		chunk_ids = [int(spec[1]) for spec in chunk_specs]
@@ -3683,7 +4804,7 @@ def main():
 				mean_activations=mean_activations_all,
 				device=device,
 			)
-			answers = model.generate_from_prefix_cache(
+			answers = _model.generate_from_prefix_cache(
 				repeated_prefix,
 				fwd_hooks=hooks,
 				stop_at_eos=True,
@@ -3711,6 +4832,7 @@ def main():
 		]
 
 	def _compute_rowwise_chunk_prefill_decode(layer_label, chunk_specs, batch_prompt):
+		_model, _, _ = _ensure_model_loaded()
 		K = len(chunk_specs)
 		chunk_ids = [int(spec[1]) for spec in chunk_specs]
 		repeated_rows = [row for row in batch_prompt for _ in range(K)]
@@ -3724,7 +4846,7 @@ def main():
 			device=device,
 		)
 		repeated_prompts = [str(row[prompt_col]) for row in repeated_rows]
-		answers = model.generate(
+		answers = _model.generate(
 			repeated_prompts,
 			max_new_tokens=max_new_tokens,
 			do_sample=False,
@@ -3735,6 +4857,7 @@ def main():
 		return [(acc_matrix[j], sem_list[j], answers_list[j]) for j in range(K)]
 
 	def _compute_rowwise_chunk_input_only(layer_label, chunk_specs, batch_prompt):
+		_model, _, _ = _ensure_model_loaded()
 		K = len(chunk_specs)
 		chunk_ids = [int(spec[1]) for spec in chunk_specs]
 		repeated_rows = [row for row in batch_prompt for _ in range(K)]
@@ -3748,13 +4871,13 @@ def main():
 			device=device,
 		)
 		repeated_prompts = [str(row[prompt_col]) for row in repeated_rows]
-		prefix = model.prefill_prefix_batch(
+		prefix = _model.prefill_prefix_batch(
 			repeated_prompts,
 			max_new_tokens=max_new_tokens,
 			use_kv_cache=True,
 			fwd_hooks=hooks,
 		)
-		answers = model.generate_from_prefix_cache(
+		answers = _model.generate_from_prefix_cache(
 			prefix,
 			fwd_hooks=None,
 			stop_at_eos=True,
@@ -3764,154 +4887,184 @@ def main():
 		acc_matrix, sem_list, answers_list = _split_flat_eval_by_spec(acc_flat, sem_flat, answers, len(batch_prompt), K)
 		return [(acc_matrix[j], sem_list[j], answers_list[j]) for j in range(K)]
 
-	for start in tqdm(range(0, len(eval_prompts), batch_size), total=(len(eval_prompts) + batch_size - 1)//batch_size, desc="Prefix batches"):
-		end = min(start + batch_size, len(eval_prompts))
-		batch_prompt = eval_prompts[start:end]
-		batch_baseline_eval = baseline_eval[start:end]
 
-		# Where to write this batch in scores_out
-		# - if keeping full dataset: write to the original row positions eval_indices[start:end]
-		# - otherwise (scores_out == eval subset or full unsampled-disabled): write by positional slice [start:end]
-		if args.use_spectral_sampling and args.keep_unsampled_rows:
-			batch_row_pos = np.asarray(eval_indices[start:end], dtype=int)  # positions in scores_out
-		else:
-			batch_row_pos = slice(start, end)
+	batch_starts = list(range(0, len(eval_prompts), batch_size))
+	ablation_cache_materialized = False
 
-		prefix_batches = None
-		batch_ranges = None
-		if args.decode_only:
-			need_prefill = False
-			for layer_label, neuron_id, _baseline_subset, _layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
-				safe_layer_key = _safe_layer_label(layer_label)
-				cache_path = _flip_cache_path(rules_subdir, safe_layer_key, neuron_id, start)
-				if _load_cached_eval(cache_path, batch_prompt, score_from_answers=False) is None:
-					need_prefill = True
-					break
+	existing_scores_out = _load_existing_scores_if_complete()
+	if existing_scores_out is not None:
+		scores_out = existing_scores_out
+		ablation_cache_materialized = True
+	else:
+		all_ablation_pkls_exist, missing_ablation_pkls = _all_ablation_cache_files_exist(batch_starts)
+		if all_ablation_pkls_exist:
+			print("[Cache] All ablation .pkl files exist; rebuilding flip columns cache-only (no prefix prefill/generation).")
+			scores_out = _rebuild_scores_from_ablation_cache_only(batch_starts)
+			Path(_existing_scores_path()).parent.mkdir(parents=True, exist_ok=True)
+			scores_out.to_csv(_existing_scores_path(), index=False)
+			print(f"[Cache] Wrote materialized flip columns to {_existing_scores_path()}.")
+			ablation_cache_materialized = True
+		elif missing_ablation_pkls:
+			print(f"[Cache] Found missing ablation cache files; generation needed. First missing: {missing_ablation_pkls[0]}")
 
-			if need_prefill:
-				prefix_batches, batch_ranges = build_prefix_caches_for_examples(
-					model,
-					batch_prompt,
-					prompt_col,
-					max_new_tokens=max_new_tokens,
-					batch_size=batch_size,
-				)
+	if not ablation_cache_materialized:
+		for start in tqdm(batch_starts, total=len(batch_starts), desc="Ablation cache/generation batches"):
+			end = min(start + batch_size, len(eval_prompts))
+			batch_prompt = eval_prompts[start:end]
+			batch_baseline_eval = baseline_eval[start:end]
 
-		# Old execution path, kept for parity and for low-memory runs.
-		if neuron_batch_size <= 1:
-			for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, hooks, _cache_policy_tag in tqdm(neuron_specs, desc="Neurons" if show_batch_tqdm else None):
-				layer_key = _safe_layer_label(layer_label)
-				_ensure_flip_cols(layer_key, neuron_id)
-				cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start)
+			# Where to write this batch in scores_out
+			# - if keeping full dataset: write to the original row positions eval_indices[start:end]
+			# - otherwise (scores_out == eval subset or full unsampled-disabled): write by positional slice [start:end]
+			if args.use_spectral_sampling and args.keep_unsampled_rows:
+				batch_row_pos = np.asarray(eval_indices[start:end], dtype=int)  # positions in scores_out
+			else:
+				batch_row_pos = slice(start, end)
 
-				cached_eval = _load_cached_eval(cache_path, batch_prompt)
-				if cached_eval is None:
-					if args.decode_only:
-						_, acc, answers = get_correctness_cached_by_prefix_batches(
-							model,
-							batch_prompt,
-							is_answer_positive_fn,
-							prompt_col,
-							prefix_batches,
-							batch_ranges,
-							hooks=hooks,
-							return_answers=True,
-						)
-					elif args.input_only:
-						batch_prompts = [str(ex[prompt_col]) for ex in batch_prompt]
-						prefix = model.prefill_prefix_batch(
-							batch_prompts,
-							max_new_tokens=max_new_tokens,
-							use_kv_cache=True,
-							fwd_hooks=hooks,
-						)
-						answers = model.generate_from_prefix_cache(
-							prefix,
-							fwd_hooks=None,
-							stop_at_eos=True,
-							clone_kv_cache_tensors=False,
-						)
-						acc = _score_repeated_rows(batch_prompt, answers)
-					else:
-						_, acc, answers = get_correctness(
-							model,
-							batch_prompt,
-							is_answer_positive_fn,
-							prompt_col,
-							max_new_tokens=max_new_tokens,
-							hooks=hooks,
-							batch_size=batch_size,
-							tqdm_desc=None,
-							return_answers=True,
-						)
-					ablated_correct = (np.asarray(acc) > 0.5).astype(bool)
-					semantics = _semantic_arrays(batch_prompt, answers)
-					_save_cached_eval(cache_path, ablated_correct, semantics, answers=answers)
-				else:
-					ablated_correct = np.asarray(cached_eval.get("correct", [])).astype(bool)
-					semantics = cached_eval.get("semantics", {}) or {}
+			prefix_batches = None
+			batch_ranges = None
+			if args.decode_only:
+				need_prefill = False
+				for layer_label, neuron_id, _baseline_subset, _layer_key, rules_subdir, _hooks, _cache_policy_tag in neuron_specs:
+					safe_layer_key = _safe_layer_label(layer_label)
+					cache_path = _flip_cache_path(rules_subdir, safe_layer_key, neuron_id, start)
+					# Prefix prefill is only needed when at least one ablation cache file is absent.
+					# Do not unpickle/rescore here; BON rescoring can launch the classifier LLM.
+					if not _cached_eval_file_exists(cache_path):
+						need_prefill = True
+						break
 
-				_write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
-			continue
+				if need_prefill:
+					_model, _, _ = _ensure_model_loaded()
+					prefix_batches, batch_ranges = build_prefix_caches_for_examples(
+						_model,
+						batch_prompt,
+						prompt_col,
+						max_new_tokens=max_new_tokens,
+						batch_size=batch_size,
+					)
 
-		# Row-wise multi-neuron path. Each synthetic row ablates exactly one neuron,
-		# including singleton donor-safe replacement for mean-donor variants.
-		layer_iter = neuron_specs_by_layer.items()
-		# if show_batch_tqdm:
-		# 	layer_iter = tqdm(list(layer_iter), desc="Layers")
-		for layer_label, specs_this_layer in layer_iter:
-			for chunk_start in range(0, len(specs_this_layer), neuron_batch_size):
-				chunk_specs_all = specs_this_layer[chunk_start:chunk_start + neuron_batch_size]
+			# Old execution path, kept for parity and for low-memory runs.
+			if neuron_batch_size <= 1:
+				for layer_label, neuron_id, _baseline_subset, layer_key, rules_subdir, hooks, _cache_policy_tag in tqdm(neuron_specs, desc="Neurons" if show_batch_tqdm else None):
+					layer_key = _safe_layer_label(layer_label)
+					_ensure_flip_cols(layer_key, neuron_id)
+					cache_path = _flip_cache_path(rules_subdir, layer_key, neuron_id, start)
 
-				cached_or_none = []
-				compute_specs = []
-				for spec in chunk_specs_all:
-					layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
-					layer_key_i = _safe_layer_label(layer_label_i)
-					_ensure_flip_cols(layer_key_i, neuron_id_i)
-					cache_path = _flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start)
-					cached = _load_cached_eval(cache_path, batch_prompt)
-					cached_or_none.append(cached)
-					if cached is None:
-						compute_specs.append(spec)
-
-				computed_by_key = {}
-				if compute_specs:
-					if args.decode_only:
-						if prefix_batches is None or batch_ranges is None:
-							prefix_batches, batch_ranges = build_prefix_caches_for_examples(
-								model,
+					cached_eval = _load_cached_eval(cache_path, batch_prompt, score_from_answers=False)
+					if cached_eval is None:
+						_model, _, _ = _ensure_model_loaded()
+						if args.decode_only:
+							_, acc, answers = get_correctness_cached_by_prefix_batches(
+								_model,
 								batch_prompt,
+								is_answer_positive_fn,
+								prompt_col,
+								prefix_batches,
+								batch_ranges,
+								hooks=hooks,
+								return_answers=True,
+							)
+						elif args.input_only:
+							batch_prompts = [str(ex[prompt_col]) for ex in batch_prompt]
+							prefix = _model.prefill_prefix_batch(
+								batch_prompts,
+								max_new_tokens=max_new_tokens,
+								use_kv_cache=True,
+								fwd_hooks=hooks,
+							)
+							answers = _model.generate_from_prefix_cache(
+								prefix,
+								fwd_hooks=None,
+								stop_at_eos=True,
+								clone_kv_cache_tensors=False,
+							)
+							acc = _score_repeated_rows(batch_prompt, answers)
+						else:
+							_, acc, answers = get_correctness(
+								_model,
+								batch_prompt,
+								is_answer_positive_fn,
 								prompt_col,
 								max_new_tokens=max_new_tokens,
+								hooks=hooks,
 								batch_size=batch_size,
+								tqdm_desc=None,
+								return_answers=True,
 							)
-						computed_list = _compute_rowwise_chunk_decode_only(layer_label, compute_specs, prefix_batches, batch_ranges, batch_prompt)
-					elif args.input_only:
-						computed_list = _compute_rowwise_chunk_input_only(layer_label, compute_specs, batch_prompt)
+						ablated_correct = (np.asarray(acc) > 0.5).astype(bool)
+						semantics = _semantic_arrays(batch_prompt, answers)
+						_save_cached_eval(cache_path, ablated_correct, semantics, answers=answers)
 					else:
-						computed_list = _compute_rowwise_chunk_prefill_decode(layer_label, compute_specs, batch_prompt)
+						ablated_correct = np.asarray(cached_eval.get("correct", [])).astype(bool)
+						semantics = cached_eval.get("semantics", {}) or {}
 
-					for spec, (arr, semantics, answers_j) in zip(compute_specs, computed_list):
+					_write_ablation_flips(layer_key, neuron_id, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
+				continue
+
+			# Row-wise multi-neuron path. Each synthetic row ablates exactly one neuron,
+			# including singleton donor-safe replacement for mean-donor variants.
+			layer_iter = neuron_specs_by_layer.items()
+			# if show_batch_tqdm:
+			# 	layer_iter = tqdm(list(layer_iter), desc="Layers")
+			for layer_label, specs_this_layer in layer_iter:
+				for chunk_start in range(0, len(specs_this_layer), neuron_batch_size):
+					chunk_specs_all = specs_this_layer[chunk_start:chunk_start + neuron_batch_size]
+
+					cached_or_none = []
+					compute_specs = []
+					for spec in chunk_specs_all:
 						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
 						layer_key_i = _safe_layer_label(layer_label_i)
-						arr = np.asarray(arr).astype(bool)
-						semantics = semantics or {}
-						computed_by_key[(str(layer_label_i), int(neuron_id_i))] = {"correct": arr, "semantics": semantics, "answers": answers_j}
-						_save_cached_eval(_flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start), arr, semantics, answers=answers_j)
+						_ensure_flip_cols(layer_key_i, neuron_id_i)
+						cache_path = _flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start)
+						cached = _load_cached_eval(cache_path, batch_prompt, score_from_answers=False)
+						cached_or_none.append(cached)
+						if cached is None:
+							compute_specs.append(spec)
 
-				for spec, cached in zip(chunk_specs_all, cached_or_none):
-					layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, _rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
-					layer_key_i = _safe_layer_label(layer_label_i)
-					if cached is None:
-						payload = computed_by_key[(str(layer_label_i), int(neuron_id_i))]
-					else:
-						payload = cached
-					ablated_correct = np.asarray(payload.get("correct", [])).astype(bool)
-					semantics = payload.get("semantics", {}) or {}
-					_write_ablation_flips(layer_key_i, neuron_id_i, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
+					computed_by_key = {}
+					if compute_specs:
+						if args.decode_only:
+							if prefix_batches is None or batch_ranges is None:
+								_model, _, _ = _ensure_model_loaded()
+								prefix_batches, batch_ranges = build_prefix_caches_for_examples(
+									_model,
+									batch_prompt,
+									prompt_col,
+									max_new_tokens=max_new_tokens,
+									batch_size=batch_size,
+								)
+							computed_list = _compute_rowwise_chunk_decode_only(layer_label, compute_specs, prefix_batches, batch_ranges, batch_prompt)
+						elif args.input_only:
+							computed_list = _compute_rowwise_chunk_input_only(layer_label, compute_specs, batch_prompt)
+						else:
+							computed_list = _compute_rowwise_chunk_prefill_decode(layer_label, compute_specs, batch_prompt)
 
-	scores_out.to_csv(os.path.join(args.rules_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
+						for spec, (arr, semantics, answers_j) in zip(compute_specs, computed_list):
+							layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
+							layer_key_i = _safe_layer_label(layer_label_i)
+							arr = np.asarray(arr).astype(bool)
+							semantics = semantics or {}
+							computed_by_key[(str(layer_label_i), int(neuron_id_i))] = {"correct": arr, "semantics": semantics, "answers": answers_j}
+							_save_cached_eval(_flip_cache_path(rules_subdir_i, layer_key_i, neuron_id_i, start), arr, semantics, answers=answers_j)
+
+					for spec, cached in zip(chunk_specs_all, cached_or_none):
+						layer_label_i, neuron_id_i, _baseline_subset_i, layer_key_i, _rules_subdir_i, _hooks_i, _cache_policy_tag_i = spec
+						layer_key_i = _safe_layer_label(layer_label_i)
+						if cached is None:
+							payload = computed_by_key[(str(layer_label_i), int(neuron_id_i))]
+						else:
+							payload = cached
+						ablated_correct = np.asarray(payload.get("correct", [])).astype(bool)
+						semantics = payload.get("semantics", {}) or {}
+						_write_ablation_flips(layer_key_i, neuron_id_i, ablated_correct, batch_baseline_eval, batch_row_pos, semantics=semantics)
+
+		scores_out.to_csv(os.path.join(args.rules_dir, 'stats', args.stats_dirname, f"scores.csv"), index=False)
+
+	# The remaining work is CPU/dataframe/RuleSHAP only.  Drop the target LLM so
+	# cached BON runs do not carry hundreds of GB into rule extraction.
+	_release_model()
 
 	# ----------------- aggregate flip stats (per neuron) -----------------
 	scores_for_final_stats = scores_out
@@ -4002,12 +5155,17 @@ def main():
 					eval_df = scores_out.loc[_test_mask].copy()
 					rules_df = scores_out.loc[~_test_mask].copy()
 
-				# If spectral sampling kept unsampled rows, train/eval should only see sampled rows
-				# (unsampled rows have NA flip targets).
-				if args.use_spectral_sampling and args.keep_unsampled_rows and ("_sampled" in rules_df.columns):
-					rules_df = rules_df.loc[rules_df["_sampled"].astype(bool)].copy()
-					if eval_df is not None and ("_sampled" in eval_df.columns):
-						eval_df = eval_df.loc[eval_df["_sampled"].astype(bool)].copy()
+				# If spectral sampling kept unsampled rows, train/eval should only see rows
+				# with evaluated flip targets. Prefer _evaluated (which includes forced
+				# held-out test rows) and fall back to the historical _sampled mask.
+				if args.use_spectral_sampling and args.keep_unsampled_rows:
+					mask_col = "_evaluated" if "_evaluated" in rules_df.columns else ("_sampled" if "_sampled" in rules_df.columns else None)
+					if mask_col is not None:
+						rules_df = rules_df.loc[rules_df[mask_col].astype(bool)].copy()
+					if eval_df is not None:
+						emask_col = "_evaluated" if "_evaluated" in eval_df.columns else ("_sampled" if "_sampled" in eval_df.columns else None)
+						if emask_col is not None:
+							eval_df = eval_df.loc[eval_df[emask_col].astype(bool)].copy()
 
 				# For cognitive-bias tasks, remove ablated datapoints whose generated answer is
 				# semantically invalid before fitting/evaluating rules. This prevents high-MCC
@@ -4044,15 +5202,16 @@ def main():
 						targets=targets_this,
 						args=args,
 						features_json_fingerprint=features_json_fp,
+						eval_df=eval_df,
 					)
-					if all(
-						should_skip_rule_extraction(
-							rules_subdir,
-							prefix,
-							f"{layer_key}_{neuron_id}",
-							signature=signature,
-						)
-						for prefix in prefixes
+					if should_skip_rule_extraction(
+						rules_subdir,
+						"",
+						f"{layer_key}_{neuron_id}",
+						signature=signature,
+						force_recompute=bool(getattr(args, "force_rule_recompute", False)),
+						require_all_fit=bool(getattr(args, "emit_all_fit_rules", True)),
+						targets=targets_this,
 					):
 						print(f"[Rules] Skipping (cached, signature match) neuron {layer_label}:{neuron_id} -> {targets_this}")
 						continue

@@ -11,6 +11,72 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+
+def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Filter rule rows by minimum held-out dataset_coverage.
+
+    This support floor avoids sparse perfect-MCC artifacts driving HQ counts.
+    Set min_dataset_coverage <= 0 to disable.  Older artifacts without a
+    coverage column are left untouched.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        floor = float(min_dataset_coverage)
+    except Exception:
+        floor = DEFAULT_MIN_RULE_DATASET_COVERAGE
+    if floor <= 0:
+        return df.copy()
+    cov_col = None
+    for c in ("dataset_coverage", "coverage"):
+        if c in df.columns:
+            cov_col = c
+            break
+    if cov_col is None:
+        return df.copy()
+    out = df.copy()
+    cov = pd.to_numeric(out[cov_col], errors="coerce")
+    return out[cov >= floor].copy()
+
+def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only held-out/eval-scored rule-combo rows."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "flip_target" in out.columns:
+        out = out[~out["flip_target"].astype(str).str.startswith("train_")].copy()
+    if "rule_combo_path" in out.columns:
+        out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
+    return out
+
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Load eval-scored rows and keep one best row per localized neuron."""
+    all_path = run_dir / "rule_combo_metrics_all.csv"
+    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
+    if all_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        if df.empty:
+            return df
+        sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
+        for c in sort_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
+        if not key_cols:
+            key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
+        if key_cols:
+            df = df.drop_duplicates(key_cols, keep="first")
+        return df
+    if best_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
+        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    return pd.DataFrame()
+
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -109,18 +175,17 @@ def infer_quality_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def threshold_counts_from_csv(run_dir: Path, thresholds: List[float]) -> Dict[str, float]:
-    candidates = [
-        run_dir / 'rule_combo_metrics_best_per_neuron.csv',
-        run_dir / 'rule_combo_metrics_top_50.csv',
-        run_dir / 'rule_combo_metrics_all.csv',
-    ]
-    df = pd.DataFrame()
-    for path in candidates:
-        if path.exists():
-            df = safe_read_csv(path)
-            if not df.empty:
-                break
+def threshold_counts_from_csv(run_dir: Path, thresholds: List[float], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> Dict[str, float]:
+    df = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage)
+    if df.empty:
+        candidates = [
+            run_dir / 'rule_combo_metrics_top_50.csv',
+        ]
+        for path in candidates:
+            if path.exists():
+                df = _apply_min_dataset_coverage(_drop_train_scored_rule_rows(safe_read_csv(path)), min_dataset_coverage)
+                if not df.empty:
+                    break
 
     out: Dict[str, float] = {}
     if df.empty:
@@ -509,7 +574,12 @@ def cha_budget_metrics(run_name: str, localization_index: Dict[str, List[Path]])
     return out
 
 
-def extract_metrics(run_dir: Path, thresholds: List[float], localization_index: Optional[Dict[str, List[Path]]] = None) -> Dict[str, float]:
+def extract_metrics(
+    run_dir: Path,
+    thresholds: List[float],
+    localization_index: Optional[Dict[str, List[Path]]] = None,
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+) -> Dict[str, float]:
     rule = safe_load_json(run_dir / 'rule_metrics_summary.json')
     flip = safe_load_json(run_dir / 'flip_stats_global.json')
 
@@ -530,19 +600,19 @@ def extract_metrics(run_dir: Path, thresholds: List[float], localization_index: 
     put('dataset_coverage_median', ((rule.get('dataset_coverage') or {}).get('median')))
     put('union_flip_any_unique_rate', flip.get('union_flip_any_unique_rate'))
 
-    out.update(threshold_counts_from_csv(run_dir, thresholds))
+    out.update(threshold_counts_from_csv(run_dir, thresholds, min_dataset_coverage=min_dataset_coverage))
     if localization_index:
         out.update(cha_budget_metrics(run_dir.name, localization_index))
     return out
 
 
-def build_summary_df(stats_root: Path, baseline_run_name: str, baseline_m: int, baseline_tau: float, thresholds: List[float]) -> pd.DataFrame:
+def build_summary_df(stats_root: Path, baseline_run_name: str, baseline_m: int, baseline_tau: float, thresholds: List[float], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
     rows = []
     localization_index = build_localization_index(stats_root)
     for run_dir in discover_run_dirs(stats_root):
         M, tau = parse_run_params(run_dir, baseline_run_name, baseline_m, baseline_tau)
         row = {'run_name': run_dir.name, 'run_dir': str(run_dir), 'M': M, 'tau': tau}
-        row.update(extract_metrics(run_dir, thresholds, localization_index))
+        row.update(extract_metrics(run_dir, thresholds, localization_index, min_dataset_coverage=min_dataset_coverage))
         rows.append(row)
     df = pd.DataFrame(rows)
     if df.empty:
@@ -820,6 +890,8 @@ def main() -> None:
     ap.add_argument('--baseline_tau', type=float, default=DEFAULT_BASELINE_TAU)
     ap.add_argument('--baseline_run_name', default=DEFAULT_BASELINE_RUN_NAME)
     ap.add_argument('--quality_thresholds', nargs='*', type=float, default=DEFAULT_QUALITY_THRESHOLDS)
+    ap.add_argument('--min_rule_dataset_coverage', type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
+                    help='Minimum held-out dataset_coverage required before a rule contributes to threshold-sensitivity counts. Use 0 to disable.')
     ap.add_argument('--paper_fig_dir', default=None, help='Optional paper figure directory. If set, cha_budget_vs_tau.pdf is copied there.')
     args = ap.parse_args()
 
@@ -828,7 +900,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = build_summary_df(stats_root, args.baseline_run_name, args.baseline_M, args.baseline_tau, thresholds)
+    df = build_summary_df(stats_root, args.baseline_run_name, args.baseline_M, args.baseline_tau, thresholds, min_dataset_coverage=args.min_rule_dataset_coverage)
     if df.empty:
         raise SystemExit(f'No sensitivity-analysis runs found under: {stats_root}')
 

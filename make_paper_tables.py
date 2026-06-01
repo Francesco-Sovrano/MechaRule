@@ -55,7 +55,8 @@ TABLE2_RUNS = [
     "rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor-fake_targets",
 ]
 
-DEFAULT_THRESHOLDS = [0.80, 0.85, 0.90, 0.95, 0.99]
+DEFAULT_THRESHOLDS = [0.75, 0.80, 0.85, 0.90, 0.95]
+DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
 DEFAULT_TABLE3_BINS = [0.2, 0.3, 0.5, 1.0]
 
 # Main paper tables intentionally cover arithmetic and jailbreaking.
@@ -621,10 +622,483 @@ def _directional_union_rate_from_hq_coverage(
     return float("nan")
 
 
-def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, coverage_source: str = "all") -> pd.DataFrame:
+
+def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Keep rule rows with sufficient held-out dataset_coverage.
+
+    The support floor prevents ultra-sparse rules from entering HQ counts or
+    strict threshold sweeps merely because their MCC is perfect on tiny support.
+    Set min_dataset_coverage <= 0 to disable.  Older artifacts without coverage
+    metadata are left untouched.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        floor = float(min_dataset_coverage)
+    except Exception:
+        floor = DEFAULT_MIN_RULE_DATASET_COVERAGE
+    if floor <= 0:
+        return df.copy()
+    cov_col = None
+    for c in ("dataset_coverage", "coverage"):
+        if c in df.columns:
+            cov_col = c
+            break
+    if cov_col is None:
+        return df.copy()
+    out = df.copy()
+    cov = pd.to_numeric(out[cov_col], errors="coerce")
+    return out[cov >= floor].copy()
+
+def _normalize_score_scope(scope: str) -> str:
+    s = str(scope or "test").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if s in ("eval", "heldout", "held+out", "test"):
+        return "test"
+    if s in ("all+fit", "allfit", "final+all+fit", "finalfit", "all"):
+        return "all_fit"
+    if s in ("train+test", "train+eval", "all+data", "traintest"):
+        return "all_fit"
+    if s.startswith("train"):
+        return "train"
+    return s.replace("+", "_")
+
+
+def _score_scope_slug(scope: str) -> str:
+    return _normalize_score_scope(scope).replace("+", "_").replace("-", "_")
+
+
+def _score_scope_label(scope: str) -> str:
+    scope = _normalize_score_scope(scope)
+    if scope == "test":
+        return "test"
+    if scope == "all_fit":
+        return "all-fit"
+    return scope
+
+
+def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str = "test") -> pd.DataFrame:
+    """Keep rows for a requested scoring scope.
+
+    TEST is the primary held-out metric. ALL-FIT is a descriptive score for a separate final-fit combo selected and scored on all rows. TRAIN rows are never included unless explicitly requested.
+    """
+    if df is None or df.empty:
+        return df
+    want = _normalize_score_scope(score_scope)
+    out = df.copy()
+    path = out.get("rule_combo_path", pd.Series([""] * len(out), index=out.index)).astype(str)
+    fname = out.get("source_filename", pd.Series([""] * len(out), index=out.index)).astype(str)
+    file_s = path + "/" + fname
+    is_file_train_test = file_s.str.contains("rule_combo_train_test_", regex=False)
+    if bool(is_file_train_test.any()):
+        # Raw rule_combo_train_test_* files are obsolete.  TRAIN+TEST is derived
+        # from raw TRAIN and TEST component rows, not read as a raw scope.
+        out = out.loc[~is_file_train_test].copy()
+        path = out.get("rule_combo_path", pd.Series([""] * len(out), index=out.index)).astype(str)
+        fname = out.get("source_filename", pd.Series([""] * len(out), index=out.index)).astype(str)
+        file_s = path + "/" + fname
+        is_file_train_test = file_s.str.contains("rule_combo_train_test_", regex=False)
+    is_file_all_fit = file_s.str.contains("rule_combo_all_fit_", regex=False)
+    is_file_train = file_s.str.contains("rule_combo_train_", regex=False) & (~is_file_train_test) & (~is_file_all_fit)
+    if "computed_on" in out.columns or "score_scope" in out.columns:
+        if "computed_on" in out.columns:
+            vals = out["computed_on"].map(_normalize_score_scope)
+        else:
+            vals = out["score_scope"].map(_normalize_score_scope)
+        # Filename scope is authoritative for cached rule-combo artifacts.
+        vals = vals.mask(is_file_train_test, "train+test").mask(is_file_all_fit, "all_fit").mask(is_file_train, "train")
+        plain_test = file_s.str.contains("rule_combo_", regex=False) & (~is_file_train) & (~is_file_train_test) & (~is_file_all_fit)
+        vals = vals.mask(plain_test & vals.isin(["train+test", "train", "all_fit"]), "test")
+        out = out[vals == want].copy()
+    else:
+        # Legacy fallback based on filename/flip-target prefixes.
+        ft = out.get("flip_target", pd.Series([""] * len(out), index=out.index)).astype(str)
+        is_train = is_file_train | ft.str.startswith("train_")
+        is_all_fit = is_file_all_fit | ft.str.startswith("all_fit_")
+        is_train_test = is_file_train_test | ft.str.startswith("train_test_")
+        if want == "test":
+            out = out[(~is_train) & (~is_train_test)].copy()
+        elif want == "all_fit":
+            out = out[is_all_fit].copy()
+        elif want == "train+test":
+            out = out[is_train_test].copy()
+        else:
+            out = out[is_train & (~is_train_test)].copy()
+    return out
+
+
+
+def _safe_float(x, default=np.nan):
+    try:
+        if x is None:
+            return float(default)
+        v = float(x)
+        return v if np.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _row_get_num(row, names, default=np.nan):
+    for name in names:
+        if name in row:
+            v = _safe_float(row.get(name), default=np.nan)
+            if np.isfinite(v):
+                return v
+    return float(default)
+
+
+def _metrics_from_confusion_counts(tp, fp, tn, fn, eps=1e-12):
+    tp, fp, tn, fn = [max(0.0, _safe_float(x, 0.0)) for x in (tp, fp, tn, fn)]
+    n = tp + fp + tn + fn
+    P = tp + fn
+    N = tn + fp
+    pred = tp + fp
+    prec = tp / (pred + eps) if pred > 0 else np.nan
+    rec = tp / (P + eps) if P > 0 else np.nan
+    f1 = (2.0 * prec * rec / (prec + rec + eps)) if (np.isfinite(prec) and np.isfinite(rec) and (prec + rec) > 0) else np.nan
+    acc = (tp + tn) / n if n > 0 else np.nan
+    tnr = tn / (N + eps) if N > 0 else np.nan
+    bal = 0.5 * (rec + tnr) if np.isfinite(rec) and np.isfinite(tnr) else np.nan
+    den = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = (tp * tn - fp * fn) / (np.sqrt(den) + eps) if den > 0 else 0.0
+    base = P / n if n > 0 else np.nan
+    return {
+        "dataset_coverage": pred / n if n > 0 else np.nan,
+        "P(target=1|fire)": prec,
+        "Precision": prec,
+        "R(fire|target=1)": rec,
+        "F1": f1,
+        "F1(target=1|fire)": f1,
+        "Lift(target=1|fire)": prec / (base + eps) if np.isfinite(prec) and np.isfinite(base) else np.nan,
+        "Acc": acc,
+        "TPR": rec,
+        "TNR": tnr,
+        "BalancedAcc": bal,
+        "MCC": mcc,
+        "n_eval": n,
+        "n_pos": P,
+        "n_neg": N,
+        "n_fire": pred,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "target_prevalence": base,
+        "rule_fire_rate": pred / n if n > 0 else np.nan,
+    }
+
+
+def _row_rule_combo_path(row):
+    if row is None:
+        return None
+    for key in ("rule_combo_path", "source_file"):
+        val = row.get(key, "") if hasattr(row, "get") else ""
+        if val is None or (isinstance(val, float) and not np.isfinite(val)):
+            continue
+        path_s = str(val).split("::", 1)[0].strip()
+        if not path_s:
+            continue
+        path = Path(path_s)
+        if path.exists():
+            return path
+    return None
+
+
+def _semantic_remaining_for_metric_row(row, scope):
+    path = _row_rule_combo_path(row)
+    if path is None:
+        return np.nan
+    sem_path = path.parent / "semantic_filtering.json"
+    if not sem_path.exists():
+        return np.nan
+    try:
+        payload = _read_json(sem_path)
+    except Exception:
+        return np.nan
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    want = {"test": {"eval", "test"}, "train": {"train"}, "all_fit": {"train", "eval", "test"}}.get(_normalize_score_scope(scope), {str(scope)})
+    vals = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("split", "")).lower() in want and rec.get("remaining", None) is not None:
+            try:
+                vals.append(int(rec.get("remaining")))
+            except Exception:
+                pass
+    if not vals:
+        return np.nan
+    return int(sum(vals)) if _normalize_score_scope(scope) == "all_fit" else int(vals[0])
+
+
+def _scores_n_eval_for_metric_row(scores_df, row, scope):
+    m_sem = _semantic_remaining_for_metric_row(row, scope)
+    if np.isfinite(m_sem) and m_sem > 0:
+        return int(m_sem)
+    if scores_df is None or scores_df.empty:
+        return np.nan
+    mask = pd.Series(True, index=scores_df.index)
+    if "is_test" in scores_df.columns:
+        is_test = scores_df["is_test"].fillna(False).astype(bool)
+        scope_norm = _normalize_score_scope(scope)
+        if scope_norm == "test":
+            mask &= is_test
+        elif scope_norm == "train":
+            mask &= ~is_test
+    if "_sampled" in scores_df.columns:
+        try:
+            mask &= scores_df["_sampled"].fillna(False).astype(bool)
+        except Exception:
+            pass
+    target = str(row.get("flip_target", "")) if hasattr(row, "get") else ""
+    if target in scores_df.columns:
+        valid = scores_df[target].notna()
+        if bool((~valid).any()):
+            mask &= valid
+    return int(mask.sum())
+
+
+def _recover_confusion_from_metric_row(row, n_eval_fallback=np.nan, eps=1e-12):
+    """Recover TP/FP/TN/FN from a metric row.
+
+    Prefer explicit counts. For legacy summaries, recover from precision +
+    dataset_coverage/rule_fire_rate + recall/TNR/Acc before falling back to the
+    less stable TPR/TNR/F1 class-ratio formula.
+    """
+    def _finish(tp, fp, tn, fn, source):
+        vals = [float(x) for x in (tp, fp, tn, fn)]
+        if not all(np.isfinite(v) for v in vals):
+            return None, "bad_counts"
+        vals = [0.0 if abs(v) < 1e-7 else v for v in vals]
+        if min(vals) < -1e-5:
+            return None, "negative_counts"
+        vals = [max(0.0, v) for v in vals]
+        vals = [round(v) if abs(v - round(v)) < 1e-4 else v for v in vals]
+        return tuple(vals), source
+
+    tp = _row_get_num(row, ["tp", "TP"], np.nan)
+    fp = _row_get_num(row, ["fp", "FP"], np.nan)
+    tn = _row_get_num(row, ["tn", "TN"], np.nan)
+    fn = _row_get_num(row, ["fn", "FN"], np.nan)
+    if all(np.isfinite(x) for x in (tp, fp, tn, fn)):
+        return _finish(tp, fp, tn, fn, "explicit_counts")
+
+    M = _row_get_num(row, ["n_eval", "M", "n"], n_eval_fallback)
+    if not np.isfinite(M) or M <= 0:
+        return None, "missing_n_eval"
+
+    prec = _row_get_num(row, ["P(target=1|fire)", "Precision", "precision", "P"], np.nan)
+    rec = _row_get_num(row, ["R(fire|target=1)", "Recall", "recall", "TPR", "tpr"], np.nan)
+    a = _row_get_num(row, ["TPR", "tpr"], rec)
+    b = _row_get_num(row, ["TNR", "tnr"], np.nan)
+    acc = _row_get_num(row, ["Acc", "acc", "accuracy"], np.nan)
+    cov = _row_get_num(row, ["dataset_coverage", "rule_fire_rate", "coverage"], np.nan)
+    n_fire = _row_get_num(row, ["n_fire", "pred_pos", "predicted_positive"], np.nan)
+    if not np.isfinite(n_fire) and np.isfinite(cov):
+        n_fire = cov * M
+
+    if np.isfinite(n_fire) and n_fire >= 0 and np.isfinite(prec):
+        TP = prec * n_fire
+        FP = (1.0 - prec) * n_fire
+        FN = np.nan
+        TN = np.nan
+        if np.isfinite(rec) and rec > eps:
+            P_total = TP / rec
+            FN = P_total - TP
+        if not np.isfinite(TN):
+            if np.isfinite(FN):
+                TN = M - TP - FP - FN
+            elif np.isfinite(b) and FP > eps and (1.0 - b) > eps:
+                N_total = FP / (1.0 - b)
+                TN = b * N_total
+            elif np.isfinite(acc):
+                TN = acc * M - TP
+        if not np.isfinite(FN):
+            FN = M - TP - FP - TN
+        res, src = _finish(TP, FP, TN, FN, "recovered_from_precision_coverage_recall")
+        if res is not None:
+            return res, src
+
+    f = _row_get_num(row, ["F1", "F1(target=1|fire)", "f1"], np.nan)
+    if np.isfinite(a) and np.isfinite(b) and np.isfinite(f):
+        denom = 2.0 * a - f * (1.0 + a)
+        if abs(denom) > eps:
+            p_ratio = f * (1.0 - b) / denom
+            if np.isfinite(p_ratio) and p_ratio >= 0:
+                P_total = M * p_ratio / (1.0 + p_ratio)
+                N_total = M / (1.0 + p_ratio)
+                res, src = _finish(a * P_total, (1.0 - b) * N_total, b * N_total, (1.0 - a) * P_total, "recovered_from_tpr_tnr_f1")
+                if res is not None:
+                    return res, src
+
+    if np.isfinite(a) and np.isfinite(b) and np.isfinite(acc) and abs(acc - a) > eps:
+        p_ratio = (b - acc) / (acc - a)
+        if np.isfinite(p_ratio) and p_ratio >= 0:
+            P_total = M * p_ratio / (1.0 + p_ratio)
+            N_total = M / (1.0 + p_ratio)
+            res, src = _finish(a * P_total, (1.0 - b) * N_total, b * N_total, (1.0 - a) * P_total, "recovered_from_tpr_tnr_acc")
+            if res is not None:
+                return res, src
+    return None, "unrecoverable"
+
+
+def _synthesize_train_test_scope_from_rows(df: pd.DataFrame, scores_df: pd.DataFrame = None) -> pd.DataFrame:
+    if df is None or df.empty or "computed_on" not in df.columns:
+        return df
+    key_cols = [c for c in ["rule_target_dir", "neuron_key", "flip_target"] if c in df.columns]
+    if not key_cols:
+        key_cols = [c for c in ["layer_key", "neuron_id", "flip_target"] if c in df.columns]
+    if not key_cols:
+        return df
+    tmp = df.copy()
+    tmp["_scope_norm"] = tmp["computed_on"].map(_normalize_score_scope)
+    path = tmp.get("rule_combo_path", pd.Series([""] * len(tmp), index=tmp.index)).astype(str)
+    fname = tmp.get("source_filename", pd.Series([""] * len(tmp), index=tmp.index)).astype(str)
+    file_s = path + "/" + fname
+    is_file_train_test = file_s.str.contains("rule_combo_train_test_", regex=False)
+    if bool(is_file_train_test.any()):
+        # Do not preserve obsolete raw TRAIN+TEST files in table generation.
+        # Rebuild TRAIN+TEST strictly from TRAIN and TEST rows below.
+        tmp = tmp.loc[~is_file_train_test].copy()
+        path = tmp.get("rule_combo_path", pd.Series([""] * len(tmp), index=tmp.index)).astype(str)
+        fname = tmp.get("source_filename", pd.Series([""] * len(tmp), index=tmp.index)).astype(str)
+        file_s = path + "/" + fname
+        is_file_train_test = file_s.str.contains("rule_combo_train_test_", regex=False)
+    is_file_train = file_s.str.contains("rule_combo_train_", regex=False) & (~is_file_train_test)
+    is_plain_combo = file_s.str.contains("rule_combo_", regex=False) & (~is_file_train) & (~is_file_train_test)
+    tmp.loc[is_file_train_test, "_scope_norm"] = "train+test"
+    tmp.loc[is_file_train, "_scope_norm"] = "train"
+    tmp.loc[is_plain_combo & tmp["_scope_norm"].isin(["train", "train+test"]), "_scope_norm"] = "test"
+    # Recompute train+test rows from train and test whenever possible, because
+    # older generated train+test rows may have used a bad M or stale fallback.
+    out_rows = [r.drop(labels=["_scope_norm"], errors="ignore").to_dict() for _, r in tmp[tmp["_scope_norm"] != "train+test"].iterrows()]
+    for _, grp in tmp.groupby(key_cols, dropna=False):
+        train_rows = grp[grp["_scope_norm"] == "train"]
+        test_rows = grp[grp["_scope_norm"] == "test"]
+        if train_rows.empty or test_rows.empty:
+            # No safe reconstruction path.  Do not preserve cached train+test rows:
+            # earlier versions could write copied or wrongly recovered all-scope rows.
+            continue
+        train_row = train_rows.iloc[0].drop(labels=["_scope_norm"], errors="ignore").to_dict()
+        test_row = test_rows.iloc[0].drop(labels=["_scope_norm"], errors="ignore").to_dict()
+        train_counts, train_source = _recover_confusion_from_metric_row(train_row, _scores_n_eval_for_metric_row(scores_df, train_row, "train"))
+        test_counts, test_source = _recover_confusion_from_metric_row(test_row, _scores_n_eval_for_metric_row(scores_df, test_row, "test"))
+        if train_counts is None or test_counts is None:
+            continue
+        tp = train_counts[0] + test_counts[0]
+        fp = train_counts[1] + test_counts[1]
+        tn = train_counts[2] + test_counts[2]
+        fn = train_counts[3] + test_counts[3]
+        merged = dict(test_row)
+        merged.update(_metrics_from_confusion_counts(tp, fp, tn, fn))
+        merged["computed_on"] = "train+test"
+        merged["score_scope"] = "train+test"
+        merged["chosen_from"] = "merged_cached_train_and_test_confusions"
+        merged["confusion_merge_source"] = f"train:{train_source};test:{test_source}"
+        out_rows.append(merged)
+    return pd.DataFrame(out_rows)
+
+def _scope_specific_metric_paths(stats_dir: Path, score_scope: str) -> Tuple[Path, Path]:
+    slug = _score_scope_slug(score_scope)
+    return (
+        stats_dir / f"rule_combo_metrics_{slug}_all.csv",
+        stats_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv",
+    )
+
+
+def _load_best_rule_metrics(stats_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scope: str = "test", scores_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Load one rule-combo row per localized neuron for the requested scope.
+
+    ``score_scope='test'`` is the held-out score and remains the primary paper
+    metric. ``score_scope='all_fit'`` is descriptive: a separate final-fit combo selected and scored on all available rows.
+    """
+    score_scope = _normalize_score_scope(score_scope)
+    scoped_all_path, scoped_best_path = _scope_specific_metric_paths(stats_dir, score_scope)
+    all_scopes_path = stats_dir / "rule_combo_metrics_all_scopes.csv"
+    legacy_all_path = stats_dir / "rule_combo_metrics_all.csv"
+    legacy_best_path = stats_dir / "rule_combo_metrics_best_per_neuron.csv"
+
+    if score_scope == "train+test":
+        # Reconstruct train+test from TRAIN and TEST rows only.  Never trust
+        # cached train+test summaries as primary input: previous versions could
+        # contain copied TEST rows or rows recovered with a wrong M.
+        frames = []
+        if all_scopes_path.exists():
+            frames.append(pd.read_csv(all_scopes_path, low_memory=False))
+        else:
+            test_all, test_best = _scope_specific_metric_paths(stats_dir, "test")
+            train_all, train_best = _scope_specific_metric_paths(stats_dir, "train")
+            for path in (test_all, train_all, test_best, train_best):
+                if path.exists():
+                    frames.append(pd.read_csv(path, low_memory=False))
+        if not frames:
+            return pd.DataFrame()
+        all_df = _synthesize_train_test_scope_from_rows(pd.concat(frames, ignore_index=True, sort=False), scores_df=scores_df)
+        df = _filter_rule_rows_by_score_scope(all_df, "train+test")
+        if df.empty:
+            return pd.DataFrame()
+    elif scoped_all_path.exists():
+        df = pd.read_csv(scoped_all_path, low_memory=False)
+    elif all_scopes_path.exists():
+        all_df = pd.read_csv(all_scopes_path, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(all_df, score_scope)
+    elif score_scope == "test" and legacy_all_path.exists():
+        df = _filter_rule_rows_by_score_scope(pd.read_csv(legacy_all_path, low_memory=False), "test")
+    elif scoped_best_path.exists():
+        df = pd.read_csv(scoped_best_path, low_memory=False)
+        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    elif score_scope == "test" and legacy_best_path.exists():
+        df = _filter_rule_rows_by_score_scope(pd.read_csv(legacy_best_path, low_memory=False), "test")
+        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    else:
+        return pd.DataFrame()
+
+    df = _filter_rule_rows_by_score_scope(df, score_scope)
+    df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+    if df.empty:
+        return df
+    sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
+    for c in sort_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
+    if not key_cols:
+        key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
+    if key_cols:
+        df = df.drop_duplicates(key_cols, keep="first")
+    return df
+
+
+# Backward-compatible alias used by older scripts/imports.
+def _load_eval_best_rule_metrics(stats_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    return _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope="test")
+
+def _count_hq_for_scope(stats_dir: Path, score_scope: str, threshold: float, min_dataset_coverage: float, scores_df: pd.DataFrame = None) -> Any:
+    df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope, scores_df=scores_df)
+    if df.empty:
+        # Empty can mean either unavailable or truly zero; for legacy test scope
+        # this is a legitimate zero, while all-fit requires newly generated
+        # scope-specific artifacts.
+        if _normalize_score_scope(score_scope) == "train+test":
+            scoped_all, scoped_best = _scope_specific_metric_paths(stats_dir, score_scope)
+            if not scoped_all.exists() and not scoped_best.exists() and not (stats_dir / "rule_combo_metrics_all_scopes.csv").exists():
+                return pd.NA
+        return 0
+    return int((pd.to_numeric(df.get("MCC"), errors="coerce") >= float(threshold)).sum())
+
+
+def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, coverage_source: str = "all", min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scopes: Sequence[str] = ("test", "all_fit")) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
+    score_scopes = [_normalize_score_scope(s) for s in score_scopes]
     for model_root in _find_model_roots(data_root, tasks=tasks):
         stats_dir = _resolve_stats_dir(model_root, run_name)
+        scores_df_scope = None
+        sp = _feature_scores_path(model_root)
+        if sp is not None:
+            try:
+                scores_df_scope = _load_scores_df(sp)
+            except Exception:
+                scores_df_scope = None
         hq_path = stats_dir / "high_quality_neuron_flip_coverage.json"
         global_path = stats_dir / "flip_stats_global.json"
         if not hq_path.exists() and not global_path.exists():
@@ -659,22 +1133,32 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
         n_loc = _safe_int(hq.get("n_neurons_total"))
         if n_loc is None:
             n_loc = _safe_int(flip_global.get("n_neurons"))
-        rows.append({
+        row = {
             "Task": _pretty_task(task),
             "Model": _pretty_model(org, model),
             "# Loc.": n_loc,
-            "HQ": _safe_int(hq.get("n_neurons_high_quality")),
             "∪(1→0) (elig. %)": round(100.0 * c2i_share, 1) if c2i_share == c2i_share else float("nan"),
             "∪(0→1) (elig. %)": round(100.0 * i2c_share, 1) if i2c_share == i2c_share else float("nan"),
             "task_key": task,
             "model_key": model,
-        })
+        }
+        for scope in score_scopes:
+            label = _score_scope_label(scope)
+            col = "HQ test" if scope == "test" else f"HQ {label}"
+            row[col] = _count_hq_for_scope(stats_dir, scope, 0.85, min_dataset_coverage, scores_df=scores_df_scope)
+        # Backward-compatible column expected by older papers/scripts.
+        if "HQ test" in row:
+            row["HQ"] = row["HQ test"]
+        rows.append(row)
     df = pd.DataFrame(rows)
+    base_cols = ["Task", "Model", "# Loc."]
+    hq_cols = ["HQ test", "HQ all-fit"]
+    cov_cols = ["∪(1→0) (elig. %)", "∪(0→1) (elig. %)"]
     if df.empty:
         return _write_empty_table_artifacts(
             out_dir,
             "table1_main_high_quality_neurons",
-            ["Task", "Model", "# Loc.", "HQ", "∪(1→0) (elig. %)", "∪(0→1) (elig. %)"],
+            base_cols + hq_cols + cov_cols,
             caption="Table 1: End-to-end rule split + spectral coverage results."
         )
     order_task = {"Arithmetic": 0, "Jailbreaking": 1, "HANS NLI": 2}
@@ -682,10 +1166,15 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
     df["_ot"] = df["Task"].map(order_task).fillna(99)
     df["_om"] = df["Model"].map(order_model).fillna(99)
     df = df.sort_values(["_ot", "_om", "task_key", "model_key"]).drop(columns=["_ot", "_om", "task_key", "model_key"])
+    # Prefer a stable column order while preserving any non-default score scopes.
+    ordered = [c for c in base_cols + hq_cols + ["HQ"] + cov_cols if c in df.columns]
+    ordered += [c for c in df.columns if c not in ordered]
+    df = df[ordered]
     caption = (
         "Table 1: End-to-end rule split + spectral coverage results. # Loc. counts all rule-bearing localized neurons; "
-        "HQ counts those with held-out MCC >= 0.85; directional union flip coverage is normalized by eligible source examples "
-        "and includes all rule-bearing localized neurons."
+        f"HQ test counts held-out MCC >= 0.85 and dataset coverage >= {float(min_dataset_coverage):.3g}; "
+        "HQ all-fit is descriptive for the same frozen train-selected combos scored on train plus held-out rows. "
+        "Directional union flip coverage is normalized by eligible source examples and includes all rule-bearing localized neurons."
         if coverage_source != "hq"
         else "Table 1: High-quality neuron-anchored rules and HQ-only directional flip coverage, normalized by eligible source examples."
     )
@@ -693,64 +1182,82 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
     return df
 
 
-def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_names: Sequence[str] = TABLE2_RUNS, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_names: Sequence[str] = TABLE2_RUNS, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scopes: Sequence[str] = ("test", "all_fit")) -> Tuple[pd.DataFrame, pd.DataFrame]:
     per_run_rows: List[Dict[str, Any]] = []
+    score_scopes = [_normalize_score_scope(s) for s in score_scopes]
     model_roots = _find_model_roots(data_root, tasks=tasks)
     for model_root in model_roots:
         task, org, model = _task_org_model(data_root, model_root)
+        scores_df_scope = None
+        sp = _feature_scores_path(model_root)
+        if sp is not None:
+            try:
+                scores_df_scope = _load_scores_df(sp)
+            except Exception:
+                scores_df_scope = None
         for run_name in run_names:
             stats_dir = _resolve_stats_dir(model_root, run_name)
-            csv_path = stats_dir / "rule_combo_metrics_best_per_neuron.csv"
-            if csv_path.exists():
-                df = pd.read_csv(csv_path, low_memory=False)
-                mcc = pd.to_numeric(df.get("MCC"), errors="coerce")
-                n_rule_bearing = int(mcc.notna().sum())
-            else:
-                # A completed run can legitimately produce no localized neurons.
-                # In that case downstream anchoring writes no per-neuron CSV, but
-                # Table 2 must still count the configured task/model/run as zero
-                # rather than dropping it from the denominator. This is especially
-                # common for fake-target controls.
-                mcc = pd.Series(dtype=float)
-                n_rule_bearing = 0
-            for t in thresholds:
-                per_run_rows.append({
-                    "task": task,
-                    "org": org,
-                    "model": model,
-                    "run_name": run_name,
-                    "Method": RUN_CONFIGS[run_name]["display"],
-                    "threshold": float(t),
-                    "n_rule_bearing_neurons": n_rule_bearing,
-                    "n_high_quality_neurons": int((mcc >= float(t)).sum()) if not mcc.empty else 0,
-                })
+            for scope in score_scopes:
+                df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=scope, scores_df=scores_df_scope)
+                if not df.empty:
+                    mcc = pd.to_numeric(df.get("MCC"), errors="coerce")
+                    n_rule_bearing = int(mcc.notna().sum())
+                    available = True
+                else:
+                    mcc = pd.Series(dtype=float)
+                    n_rule_bearing = 0
+                    scoped_all, scoped_best = _scope_specific_metric_paths(stats_dir, scope)
+                    available = scope == "test" or scoped_all.exists() or scoped_best.exists() or (stats_dir / "rule_combo_metrics_all_scopes.csv").exists()
+                for t in thresholds:
+                    per_run_rows.append({
+                        "task": task,
+                        "org": org,
+                        "model": model,
+                        "run_name": run_name,
+                        "Method": RUN_CONFIGS[run_name]["display"],
+                        "score_scope": scope,
+                        "score_label": _score_scope_label(scope),
+                        "scope_available": bool(available),
+                        "threshold": float(t),
+                        "n_rule_bearing_neurons": n_rule_bearing if available else pd.NA,
+                        "min_dataset_coverage": float(min_dataset_coverage),
+                        "n_high_quality_neurons": int((mcc >= float(t)).sum()) if available and not mcc.empty else (0 if available else pd.NA),
+                    })
     per_run_df = pd.DataFrame(per_run_rows)
     if per_run_df.empty:
         return per_run_df, per_run_df
     wide_rows = []
     for method in [RUN_CONFIGS[r]["display"] for r in run_names]:
-        row = {"Method": method}
-        for t in thresholds:
-            sub = per_run_df[(per_run_df["Method"] == method) & (per_run_df["threshold"] == float(t))]
-            row[f"t = {t:.2f}"] = int(sub["n_high_quality_neurons"].sum()) if not sub.empty else 0
-        wide_rows.append(row)
+        for scope in score_scopes:
+            sub_scope = per_run_df[(per_run_df["Method"] == method) & (per_run_df["score_scope"] == scope)]
+            if sub_scope.empty or not bool(sub_scope["scope_available"].any()):
+                continue
+            row = {"Method": method, "Score scope": _score_scope_label(scope)}
+            for t in thresholds:
+                sub = sub_scope[sub_scope["threshold"] == float(t)]
+                vals = pd.to_numeric(sub["n_high_quality_neurons"], errors="coerce")
+                row[f"t = {t:.2f}"] = int(vals.sum()) if vals.notna().any() else pd.NA
+            wide_rows.append(row)
     wide_df = pd.DataFrame(wide_rows)
-    _write_table_artifacts(wide_df, out_dir, "table2_threshold_sweep_totals", caption="Table 2: Total number of high-quality neurons (MCC ≥ t) summed over all available task/model runs.")
+    _write_table_artifacts(wide_df, out_dir, "table2_threshold_sweep_totals", caption=f"Table 2: Total number of MCC-qualified neurons (MCC ≥ t and dataset coverage ≥ {float(min_dataset_coverage):.3g}) summed over all available task/model runs. TEST is held-out; ALL-FIT is descriptive final-fit selected and scored on all rows.")
 
-    # Also write a threshold-independent yield table. This is the number of
-    # rule-bearing localized neurons with a learned anchor attempt, i.e. the row
-    # count of rule_combo_metrics_best_per_neuron.csv. It must not be confused
-    # with n_high_quality_neurons, which applies an MCC threshold.
+    # Also write one compact table per score scope for easy inclusion.
+    for scope in score_scopes:
+        sub_scope = wide_df[wide_df.get("Score scope", pd.Series(dtype=str)) == _score_scope_label(scope)].copy() if not wide_df.empty else pd.DataFrame()
+        if not sub_scope.empty:
+            _write_table_artifacts(sub_scope.drop(columns=["Score scope"]), out_dir, f"table2_threshold_sweep_totals_{_score_scope_slug(scope)}", caption=f"Table 2 ({_score_scope_label(scope)}): MCC-qualified neurons (MCC ≥ t and dataset coverage ≥ {float(min_dataset_coverage):.3g}).")
+
+    # Also write threshold-independent yield table.
     yield_rows = []
     for method in [RUN_CONFIGS[r]["display"] for r in run_names]:
-        sub = per_run_df[per_run_df["Method"] == method]
-        if sub.empty:
-            yield_rows.append({"Method": method, "# rule-bearing localized neurons": 0})
-        else:
-            per_unit = sub.drop_duplicates(["task", "org", "model", "run_name"])
-            yield_rows.append({"Method": method, "# rule-bearing localized neurons": int(per_unit["n_rule_bearing_neurons"].sum())})
+        for scope in score_scopes:
+            sub = per_run_df[(per_run_df["Method"] == method) & (per_run_df["score_scope"] == scope) & (per_run_df["scope_available"])]
+            if sub.empty:
+                continue
+            per_unit = sub.drop_duplicates(["task", "org", "model", "run_name", "score_scope"])
+            yield_rows.append({"Method": method, "Score scope": _score_scope_label(scope), "# rule-bearing localized neurons": int(pd.to_numeric(per_unit["n_rule_bearing_neurons"], errors="coerce").fillna(0).sum())})
     yield_df = pd.DataFrame(yield_rows)
-    _write_table_artifacts(yield_df, out_dir, "table2_rule_bearing_yield_totals", caption="Threshold-independent number of rule-bearing localized neurons summed over all available task/model runs.")
+    _write_table_artifacts(yield_df, out_dir, "table2_rule_bearing_yield_totals", caption="Threshold-independent number of rule-bearing localized neurons summed over all available task/model runs, by score scope.")
 
     per_run_df.to_csv(out_dir / "table2_threshold_sweep_per_run_long.csv", index=False)
     return wide_df, per_run_df
@@ -1799,6 +2306,8 @@ def main():
     ap.add_argument("--table13_baseline_scope", type=str, default="both", choices=["both", "positive", "negative", "selected"], help="Baseline regimes used for Table 13 cross-task overlap. Default 'both' matches the paper's all-localized-neuron overlap; 'selected' uses --baseline_subset.")
     ap.add_argument("--baseline_subset", type=str, default="positive_baseline", choices=["positive_baseline", "negative_baseline"])
     ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage numerator: all rule-bearing localized neurons (paper default) or HQ-only neurons. Directional rates are normalized by eligible source examples.")
+    ap.add_argument("--score_scopes", type=str, default="test,all_fit", help="Comma-separated score scopes for HQ reporting. Default reports held-out test and descriptive all-fit scores selected and scored on all rows.")
+    ap.add_argument("--min_rule_dataset_coverage", type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE, help="Minimum dataset_coverage required before a rule contributes to HQ counts or threshold sweeps. Use 0 to disable.")
     ap.add_argument("--include_hans_in_main_tables", action="store_true", help="Include HANS/NLI in Tables 1-3/12 when matching compatible artifacts exist. The paper main tables omit HANS.")
     ap.add_argument("--table3_scope", type=str, default="all", choices=["all", "selected"], help="Table 3 scope. 'all' reproduces the paper compact table; 'selected' honors --table3_task/--table3_model/--baseline_subset.")
     ap.add_argument("--paper_tables_root", type=str, default=None, help="Optional directory containing precomputed paper table CSVs. Used as a fallback when raw neuron_buckets/rule_knockout artifacts are absent.")
@@ -1829,17 +2338,20 @@ def main():
         which = which_raw
 
     thresholds = [float(x.strip()) for x in args.thresholds.split(",") if x.strip()]
+    score_scopes = [_normalize_score_scope(x.strip()) for x in args.score_scopes.split(",") if x.strip()]
+    if not score_scopes:
+        score_scopes = ["test", "all_fit"]
     bins = _parse_bins(args.table3_bins)
 
     results: Dict[str, Any] = {}
 
     if "table1" in which:
-        df = _table1(data_root, out_root, tasks=main_table_tasks, coverage_source=args.table1_coverage_source)
+        df = _table1(data_root, out_root, tasks=main_table_tasks, coverage_source=args.table1_coverage_source, min_dataset_coverage=args.min_rule_dataset_coverage, score_scopes=score_scopes)
         results["table1_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table1] no rows")
 
     if "table2" in which:
-        df, long_df = _table2(data_root, out_root, thresholds=thresholds, tasks=main_table_tasks)
+        df, long_df = _table2(data_root, out_root, thresholds=thresholds, tasks=main_table_tasks, min_dataset_coverage=args.min_rule_dataset_coverage, score_scopes=score_scopes)
         results["table2_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table2] no rows")
 

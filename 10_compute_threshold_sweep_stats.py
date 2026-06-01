@@ -32,6 +32,72 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+
+def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Filter rule rows by minimum held-out dataset_coverage.
+
+    This support floor avoids sparse perfect-MCC artifacts driving HQ counts.
+    Set min_dataset_coverage <= 0 to disable.  Older artifacts without a
+    coverage column are left untouched.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        floor = float(min_dataset_coverage)
+    except Exception:
+        floor = DEFAULT_MIN_RULE_DATASET_COVERAGE
+    if floor <= 0:
+        return df.copy()
+    cov_col = None
+    for c in ("dataset_coverage", "coverage"):
+        if c in df.columns:
+            cov_col = c
+            break
+    if cov_col is None:
+        return df.copy()
+    out = df.copy()
+    cov = pd.to_numeric(out[cov_col], errors="coerce")
+    return out[cov >= floor].copy()
+
+def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only held-out/eval-scored rule-combo rows."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "flip_target" in out.columns:
+        out = out[~out["flip_target"].astype(str).str.startswith("train_")].copy()
+    if "rule_combo_path" in out.columns:
+        out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
+    return out
+
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Load eval-scored rows and keep one best row per localized neuron."""
+    all_path = run_dir / "rule_combo_metrics_all.csv"
+    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
+    if all_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        if df.empty:
+            return df
+        sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
+        for c in sort_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
+        if not key_cols:
+            key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
+        if key_cols:
+            df = df.drop_duplicates(key_cols, keep="first")
+        return df
+    if best_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
+        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    return pd.DataFrame()
+
 from scipy import stats
 
 # Imported only for the sample-based analysis. These functions already encode
@@ -44,6 +110,7 @@ try:
         _find_model_roots,
         _resolve_stats_dir,
         _task_org_model,
+        _load_best_rule_metrics,
     )
 except Exception:  # pragma: no cover - useful when only threshold CSV analysis is needed
     RUN_CONFIGS = {}
@@ -52,9 +119,10 @@ except Exception:  # pragma: no cover - useful when only threshold CSV analysis 
     _find_model_roots = None
     _resolve_stats_dir = None
     _task_org_model = None
+    _load_best_rule_metrics = None
 
 
-DEFAULT_THRESHOLDS = [0.80, 0.85, 0.90, 0.95, 0.99]
+DEFAULT_THRESHOLDS = [0.75, 0.80, 0.85, 0.90]
 
 LABEL_MAP = {
     "Rule split w/ Spectral anchoring plan": "Rule split + spectral coverage",
@@ -115,8 +183,31 @@ def _method_col(df: pd.DataFrame) -> str:
     raise ValueError("Could not find method column. Expected stats_label, Method, or method.")
 
 
-def load_pivot(csv_path: str | Path, metric: str) -> pd.DataFrame:
+def _normalize_score_scope(scope: str) -> str:
+    s = str(scope or "test").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if s in ("eval", "heldout", "held+out", "test"):
+        return "test"
+    if s in ("all+fit", "allfit", "final+all+fit", "finalfit", "all"):
+        return "all_fit"
+    if s in ("train+test", "train+eval", "all+data", "traintest"):
+        return "all_fit"
+    if s.startswith("train"):
+        return "train"
+    return s.replace("+", "_")
+
+
+def _score_scope_slug(scope: str) -> str:
+    return _normalize_score_scope(scope).replace("+", "_").replace("-", "_")
+
+
+def load_pivot(csv_path: str | Path, metric: str, score_scope: str = "test") -> pd.DataFrame:
     df = pd.read_csv(csv_path)
+    if "score_scope" in df.columns:
+        want = _normalize_score_scope(score_scope)
+        df = df[df["score_scope"].map(_normalize_score_scope) == want].copy()
+    elif "Score scope" in df.columns:
+        want = _normalize_score_scope(score_scope)
+        df = df[df["Score scope"].map(_normalize_score_scope) == want].copy()
     if metric not in df.columns:
         raise ValueError(f"Metric '{metric}' not found. Available columns: {list(df.columns)}")
     if "threshold" not in df.columns:
@@ -203,8 +294,8 @@ def autc_pairs(pivot: pd.DataFrame, a: str, b: str, thresholds: Iterable[float])
         y_b = g2.loc[thresholds, b].to_numpy(dtype=float)
         if np.isnan(y_a).any() or np.isnan(y_b).any():
             continue
-        autc_a = float(np.trapz(y_a, x) / (x.max() - x.min()))
-        autc_b = float(np.trapz(y_b, x) / (x.max() - x.min()))
+        autc_a = float(np.trapezoid(y_a, x) / (x.max() - x.min()))
+        autc_b = float(np.trapezoid(y_b, x) / (x.max() - x.min()))
         rows.append({"task": task, "llm": llm, "A": autc_a, "B": autc_b, "diff": autc_a - autc_b})
     return pd.DataFrame(rows)
 
@@ -392,6 +483,8 @@ def collect_per_neuron_scores(
     tasks: Sequence[str] | None,
     run_names: Sequence[str],
     metric_col: str,
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scope: str = "test",
 ) -> pd.DataFrame:
     if _find_model_roots is None or _resolve_stats_dir is None or _task_org_model is None:
         raise RuntimeError("make_paper_tables.py helpers could not be imported; sample stats require repository context.")
@@ -402,10 +495,12 @@ def collect_per_neuron_scores(
             if run_name not in RUN_CONFIGS:
                 continue
             stats_dir = _resolve_stats_dir(model_root, run_name)
-            csv_path = stats_dir / "rule_combo_metrics_best_per_neuron.csv"
-            if not csv_path.exists():
+            if _load_best_rule_metrics is not None:
+                df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope)
+            else:
+                df = _load_eval_best_rule_rows(stats_dir, min_dataset_coverage=min_dataset_coverage)
+            if df.empty:
                 continue
-            df = pd.read_csv(csv_path, low_memory=False)
             if metric_col not in df.columns:
                 if metric_col != "MCC" and "MCC" in df.columns:
                     metric_col_local = "MCC"
@@ -587,6 +682,7 @@ def main() -> None:
     ap.add_argument("--metric", default="n_high_quality_neurons")
     ap.add_argument("--thresholds", nargs="*", type=float, default=DEFAULT_THRESHOLDS)
     ap.add_argument("--primary_threshold", type=float, default=0.85)
+    ap.add_argument("--score-scope", default="both", choices=["test", "all_fit", "both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' writes/prints held-out TEST and descriptive ALL-FIT results separately.")
     ap.add_argument("--alt", choices=["two-sided", "greater", "less"], default="greater", help="Alternative for A-B.")
     ap.add_argument("--out_dir", default=None, help="Optional output directory for CSV artifacts.")
     ap.add_argument("--seed", type=int, default=0)
@@ -594,109 +690,146 @@ def main() -> None:
     ap.add_argument("--data-root", type=Path, default=None, help="If provided, also run sample-based per-neuron stats.")
     ap.add_argument("--tasks", default=",".join(DEFAULT_MAIN_TASKS), help="Comma-separated task names; empty means all.")
     ap.add_argument("--metric-col", default="MCC", help="Per-neuron score column for sample-based stats.")
+    ap.add_argument("--min-rule-dataset-coverage", type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
+                    help="Minimum held-out dataset_coverage required for sample-based per-neuron scores. Use 0 to disable.")
     ap.add_argument("--sample-stat", choices=["mean", "median", "prop_ge_threshold", "n_ge_threshold"], default="mean")
     ap.add_argument("--sample-size", type=int, default=0, help="0 means min(n_A, n_B) within each paired unit.")
     ap.add_argument("--n-boot", type=int, default=10000)
     ap.add_argument("--skip-sample-stats", action="store_true")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir) if args.out_dir else None
-    if out_dir:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    pivot = load_pivot(args.csv, args.metric)
+    base_out_dir = Path(args.out_dir) if args.out_dir else None
+    score_scopes = ["test", "all_fit"] if str(args.score_scope).strip().lower() == "both" else [_normalize_score_scope(args.score_scope)]
     thresholds = [round(float(t), 6) for t in args.thresholds]
+    wrote_dirs = []
 
-    print("\n== Method coverage ==")
-    print(coverage_report(pivot).to_string(index=False))
+    for scope in score_scopes:
+        scope_slug = _score_scope_slug(scope)
+        out_dir = None
+        if base_out_dir:
+            out_dir = base_out_dir / scope_slug if len(score_scopes) > 1 else base_out_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            wrote_dirs.append(out_dir)
 
-    totals, ns = make_table_sum(pivot, thresholds=thresholds)
-    print("\n== Descriptive threshold-sweep totals; do not use as inferential replicates ==")
-    print(totals.apply(lambda col: col.map(_fmt)).to_string())
-    print("\n== N independent task/model runs contributing to each total ==")
-    print(ns.to_string())
-    print("\n== LaTeX tabular for descriptive Table 2 ==")
-    print(to_latex_tabular(totals))
+        print(f"\n##############################")
+        print(f"# Score scope: {scope.upper()}")
+        print(f"##############################")
+        if scope == "all_fit":
+            print("Note: ALL-FIT scores are descriptive final-fit metrics selected/scored on all evaluated rows; use TEST for strict generalization.")
 
-    primary, autc, primary_pairs, autc_pairs_df = run_threshold_comparisons(
-        pivot,
-        comparisons=COMPARISONS,
-        primary_threshold=args.primary_threshold,
-        thresholds=thresholds,
-        alternative=args.alt,
-        seed=args.seed,
-    )
-
-    cols = [
-        "A_method", "B_method", "endpoint", "n_pairs", "n_nonzero", "n_pos", "n_neg",
-        "median_diff", "mean_diff", "min_diff", "max_diff",
-        "sign_p", "sign_p_holm", "signflip_p", "signflip_p_holm", "signflip_mode",
-    ]
-
-    print(f"\n== Primary exact paired tests at MCC threshold {args.primary_threshold:.2f} ==")
-    if primary.empty:
-        print("No complete paired comparisons found.")
-    else:
-        print(primary[cols].to_string(index=False))
-
-    print("\n== Sensitivity exact paired tests on AUTC over selected thresholds ==")
-    if autc.empty:
-        print("No complete paired comparisons found.")
-    else:
-        print(autc[cols].to_string(index=False))
-
-    if out_dir:
-        totals.to_csv(out_dir / "table2_descriptive_totals.csv")
-        ns.to_csv(out_dir / "table2_descriptive_n_runs.csv")
-        primary.to_csv(out_dir / "method_comparison_primary_threshold_exact_tests.csv", index=False)
-        autc.to_csv(out_dir / "method_comparison_autc_exact_tests.csv", index=False)
-        primary_pairs.to_csv(out_dir / "method_comparison_primary_threshold_pairs.csv", index=False)
-        autc_pairs_df.to_csv(out_dir / "method_comparison_autc_pairs.csv", index=False)
-
-    if not args.skip_sample_stats and args.data_root is not None:
-        tasks = _parse_csv_list(args.tasks)
-        sample_size = None if int(args.sample_size) <= 0 else int(args.sample_size)
-        print("\n== Sample-based per-neuron MCC comparison ==")
-        scores = collect_per_neuron_scores(
-            data_root=args.data_root,
-            tasks=tasks,
-            run_names=TABLE2_RUNS,
-            metric_col=args.metric_col,
-        )
-        if scores.empty:
-            print("No per-neuron score rows found. Check --data-root and run artifact paths.")
-        else:
-            per_unit = per_unit_metrics(scores, threshold=args.primary_threshold)
-            comp = run_sample_comparisons(
-                scores=scores,
-                per_unit=per_unit,
-                comparisons=COMPARISONS,
-                stat_name=args.sample_stat,
-                threshold=args.primary_threshold,
-                sample_size=sample_size,
-                n_boot=args.n_boot,
-                alternative=args.alt,
-                seed=args.seed,
-            )
-            if comp.empty:
-                print("No matched method comparisons found for sample-based stats.")
-            else:
-                sample_cols = [
-                    "A_method", "B_method", "sample_stat", "unit_metric_for_exact_test",
-                    "n_pairs", "n_nonzero", "n_pos", "n_neg", "median_diff", "mean_diff",
-                    "sign_p", "sign_p_holm", "signflip_p", "signflip_p_holm",
-                    "bootstrap_mean_diff", "bootstrap_ci95_lo", "bootstrap_ci95_hi",
-                    "sample_size_per_method_per_unit", "n_boot",
-                ]
-                print(comp[sample_cols].to_string(index=False))
+        pivot = load_pivot(args.csv, args.metric, score_scope=scope)
+        if pivot.empty or len(pivot.columns) == 0:
+            msg = f"No rows found for score scope {scope!r} in {args.csv}. New Stage 7 artifacts must be generated before this scope is available."
+            print(msg)
             if out_dir:
-                scores.to_csv(out_dir / "per_neuron_scores.csv", index=False)
-                per_unit.to_csv(out_dir / "per_unit_metrics.csv", index=False)
-                comp.to_csv(out_dir / "sampled_pairwise_comparisons.csv", index=False)
+                (out_dir / "NO_ROWS_FOR_SCORE_SCOPE.txt").write_text(msg + "\n", encoding="utf-8")
+            continue
 
-    if out_dir:
-        print(f"\nWrote CSV artifacts to {out_dir}")
+        print("\n== Method coverage ==")
+        print(coverage_report(pivot).to_string(index=False))
 
+        totals, ns = make_table_sum(pivot, thresholds=thresholds)
+        print("\n== Descriptive threshold-sweep totals; do not use as inferential replicates ==")
+        print(totals.apply(lambda col: col.map(_fmt)).to_string())
+        print("\n== N independent task/model runs contributing to each total ==")
+        print(ns.to_string())
+        print("\n== LaTeX tabular for descriptive Table 2 ==")
+        print(to_latex_tabular(totals))
+
+        primary, autc, primary_pairs, autc_pairs_df = run_threshold_comparisons(
+            pivot,
+            comparisons=COMPARISONS,
+            primary_threshold=args.primary_threshold,
+            thresholds=thresholds,
+            alternative=args.alt,
+            seed=args.seed,
+        )
+        for df in (primary, autc, primary_pairs, autc_pairs_df):
+            if not df.empty:
+                df.insert(0, "score_scope", scope)
+
+        cols = [
+            "score_scope", "A_method", "B_method", "endpoint", "n_pairs", "n_nonzero", "n_pos", "n_neg",
+            "median_diff", "mean_diff", "min_diff", "max_diff",
+            "sign_p", "sign_p_holm", "signflip_p", "signflip_p_holm", "signflip_mode",
+        ]
+        cols_no_scope = [c for c in cols if c != "score_scope"]
+
+        print(f"\n== Primary exact paired tests at MCC threshold {args.primary_threshold:.2f} ==")
+        if primary.empty:
+            print("No complete paired comparisons found.")
+        else:
+            print(primary[[c for c in cols if c in primary.columns]].to_string(index=False))
+
+        print("\n== Sensitivity exact paired tests on AUTC over selected thresholds ==")
+        if autc.empty:
+            print("No complete paired comparisons found.")
+        else:
+            print(autc[[c for c in cols if c in autc.columns]].to_string(index=False))
+
+        if out_dir:
+            totals.to_csv(out_dir / "table2_descriptive_totals.csv")
+            ns.to_csv(out_dir / "table2_descriptive_n_runs.csv")
+            primary.to_csv(out_dir / "method_comparison_primary_threshold_exact_tests.csv", index=False)
+            autc.to_csv(out_dir / "method_comparison_autc_exact_tests.csv", index=False)
+            primary_pairs.to_csv(out_dir / "method_comparison_primary_threshold_pairs.csv", index=False)
+            autc_pairs_df.to_csv(out_dir / "method_comparison_autc_pairs.csv", index=False)
+
+        if not args.skip_sample_stats and args.data_root is not None:
+            tasks = _parse_csv_list(args.tasks)
+            sample_size = None if int(args.sample_size) <= 0 else int(args.sample_size)
+            print("\n== Sample-based per-neuron MCC comparison ==")
+            scores = collect_per_neuron_scores(
+                data_root=args.data_root,
+                tasks=tasks,
+                run_names=TABLE2_RUNS,
+                metric_col=args.metric_col,
+                min_dataset_coverage=args.min_rule_dataset_coverage,
+                score_scope=scope,
+            )
+            if scores.empty:
+                print(f"No per-neuron score rows found for score scope {scope!r}. Check --data-root and run artifact paths.")
+            else:
+                scores.insert(0, "score_scope", scope)
+                per_unit = per_unit_metrics(scores, threshold=args.primary_threshold)
+                if not per_unit.empty:
+                    per_unit.insert(0, "score_scope", scope)
+                comp = run_sample_comparisons(
+                    scores=scores,
+                    per_unit=per_unit,
+                    comparisons=COMPARISONS,
+                    stat_name=args.sample_stat,
+                    threshold=args.primary_threshold,
+                    sample_size=sample_size,
+                    n_boot=args.n_boot,
+                    alternative=args.alt,
+                    seed=args.seed,
+                )
+                if not comp.empty:
+                    comp.insert(0, "score_scope", scope)
+                if comp.empty:
+                    print("No matched method comparisons found for sample-based stats.")
+                else:
+                    sample_cols = [
+                        "score_scope", "A_method", "B_method", "sample_stat", "unit_metric_for_exact_test",
+                        "n_pairs", "n_nonzero", "n_pos", "n_neg", "median_diff", "mean_diff",
+                        "sign_p", "sign_p_holm", "signflip_p", "signflip_p_holm",
+                        "bootstrap_mean_diff", "bootstrap_ci95_lo", "bootstrap_ci95_hi",
+                        "sample_size_per_method_per_unit", "n_boot",
+                    ]
+                    print(comp[[c for c in sample_cols if c in comp.columns]].to_string(index=False))
+                if out_dir:
+                    scores.to_csv(out_dir / "per_neuron_scores.csv", index=False)
+                    per_unit.to_csv(out_dir / "per_unit_metrics.csv", index=False)
+                    comp.to_csv(out_dir / "sampled_pairwise_comparisons.csv", index=False)
+
+        if out_dir:
+            print(f"\nWrote CSV artifacts for {scope} to {out_dir}")
+
+    if base_out_dir and len(wrote_dirs) > 1:
+        print("\nWrote score-scope-specific CSV artifacts to:")
+        for d in wrote_dirs:
+            print(f"  {d}")
 
 if __name__ == "__main__":
     main()

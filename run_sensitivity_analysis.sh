@@ -11,8 +11,8 @@ source .env/bin/activate
 
 EXPERIMENT_LIST=(
 	"arithmetic"
-	"hans_nli"
 	"bon_jailbreaking"
+	# "hans_nli"
 )
 
 ANALYZED_LLM_LIST=(
@@ -81,9 +81,11 @@ for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 				BATCH_SIZE=256
 				;;
 			arithmetic)
-				# MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=5
 				BATCH_SIZE=256
 				case "$ANALYZED_LLM" in
+					Qwen/Qwen2-1.5B-Instruct)
+						Z_THRESH=10
+						;;
 					Qwen/*)
 						Z_THRESH=10
 						;;
@@ -94,20 +96,17 @@ for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 				;;
 			bon_jailbreaking)
 				case "$ANALYZED_LLM" in
+					Qwen/Qwen2-1.5B-Instruct)
+						;;
 					Qwen/*)
+						# MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE=3
 						BATCH_SIZE=256
+						;;
+					*)
 						;;
 				esac
 				;;
 			hans_nli)
-				# NEURONS_TYPE_FLAG=()
-				DECODE_ONLY_FLAG=()
-				;;
-			grammar_acceptability)
-				# NEURONS_TYPE_FLAG=()
-				DECODE_ONLY_FLAG=()
-				;;
-			cognitive_bias_sensitivity)
 				# NEURONS_TYPE_FLAG=()
 				DECODE_ONLY_FLAG=()
 				;;
@@ -121,21 +120,34 @@ for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 
 			echo "Running $ANALYZED_LLM on $EXPERIMENT with Z_THRESH=$Z_THRESH, BATCH_SIZE=$BATCH_SIZE, CIRCUIT_LEVEL=$CIRCUIT_LEVEL, CIRCUIT_SIZE=$CIRCUIT_SIZE, MIN_FLIP_RATE=$MIN_FLIP_RATE, EVAL_INTERVENTION=$EVAL_INTERVENTION"
 
-			bash _run_pipeline.sh \
-				"$EXPERIMENT" \
-				"$ANALYZED_LLM" \
-				--spectral_circuit_discovery \
-				--spectral_anchoring_plan \
-				--fast_anchoring \
-				--z_thresh "$Z_THRESH" \
-				--batch_size "$BATCH_SIZE" \
-				--circuit_level "$CIRCUIT_LEVEL" \
-				--circuit_size "$CIRCUIT_SIZE" \
-				--min_flip_rate "$MIN_FLIP_RATE" \
-				--eval_intervention "$EVAL_INTERVENTION" \
-				"${DECODE_ONLY_FLAG[@]}" \
-				"${NEURONS_TYPE_FLAG[@]}" \
+			local CMD=(
+				bash _run_pipeline.sh
+				"$EXPERIMENT"
+				"$ANALYZED_LLM"
+				--spectral_circuit_discovery
+				--spectral_anchoring_plan
+				--fast_anchoring
+				--z_thresh "$Z_THRESH"
+				--batch_size "$BATCH_SIZE"
+				--circuit_level "$CIRCUIT_LEVEL"
+				--circuit_size "$CIRCUIT_SIZE"
+				--min_flip_rate "$MIN_FLIP_RATE"
+				--eval_intervention "$EVAL_INTERVENTION"
+			)
+
+			if ((${#DECODE_ONLY_FLAG[@]} > 0)); then
+				CMD+=("${DECODE_ONLY_FLAG[@]}")
+			fi
+
+			if ((${#NEURONS_TYPE_FLAG[@]} > 0)); then
+				CMD+=("${NEURONS_TYPE_FLAG[@]}")
+			fi
+
+			CMD+=(
 				--max_number_of_circuits_to_analyze "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
+			)
+
+			"${CMD[@]}"
 		}
 
 		# Default point + one-factor-at-a-time sensitivity sweeps around it.

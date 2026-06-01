@@ -10,6 +10,72 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
+DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+
+def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Filter rule rows by minimum held-out dataset_coverage.
+
+    This support floor avoids sparse perfect-MCC artifacts driving HQ counts.
+    Set min_dataset_coverage <= 0 to disable.  Older artifacts without a
+    coverage column are left untouched.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        floor = float(min_dataset_coverage)
+    except Exception:
+        floor = DEFAULT_MIN_RULE_DATASET_COVERAGE
+    if floor <= 0:
+        return df.copy()
+    cov_col = None
+    for c in ("dataset_coverage", "coverage"):
+        if c in df.columns:
+            cov_col = c
+            break
+    if cov_col is None:
+        return df.copy()
+    out = df.copy()
+    cov = pd.to_numeric(out[cov_col], errors="coerce")
+    return out[cov >= floor].copy()
+
+def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only held-out/eval-scored rule-combo rows."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "flip_target" in out.columns:
+        out = out[~out["flip_target"].astype(str).str.startswith("train_")].copy()
+    if "rule_combo_path" in out.columns:
+        out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
+    return out
+
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    """Load eval-scored rows and keep one best row per localized neuron."""
+    all_path = run_dir / "rule_combo_metrics_all.csv"
+    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
+    if all_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        if df.empty:
+            return df
+        sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
+        for c in sort_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
+        if not key_cols:
+            key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
+        if key_cols:
+            df = df.drop_duplicates(key_cols, keep="first")
+        return df
+    if best_path.exists():
+        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
+        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    return pd.DataFrame()
+
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -216,17 +282,16 @@ def union_flip_stats(scores_df: pd.DataFrame, cols: list[str]) -> dict:
 
 # ------------------------- rule-metric collection -------------------------
 
-def collect_rule_metrics_best(runs: list[Path]) -> pd.DataFrame:
+def collect_rule_metrics_best(runs: list[Path], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
     blocks = []
     for run_dir in runs:
         run_name = run_dir.name
         if run_name not in NAME_MAP:
             continue
         run_label = NAME_MAP[run_name]
-        fp = run_dir / "rule_combo_metrics_best_per_neuron.csv"
-        if not fp.exists():
+        df = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage)
+        if df.empty:
             continue
-        df = safe_read_csv(fp)
         df["stats_dirname"] = run_name
         df["stats_label"] = run_label
         blocks.append(df)
@@ -647,12 +712,13 @@ def threshold_sweep_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.D
             continue
         run_label = NAME_MAP[run_name]
 
-        best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
         scores_path = run_dir / "scores.csv"
-        if not best_path.exists() or not scores_path.exists():
+        if not scores_path.exists():
             continue
 
-        df_best = safe_read_csv(best_path)
+        df_best = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=args.min_rule_dataset_coverage)
+        if df_best.empty:
+            continue
         if mcol not in df_best.columns:
             mcol_local = "MCC"
         else:
@@ -732,7 +798,7 @@ def threshold_sweep_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.D
 def rule_metrics_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     runs = discover_runs(stats_root, run_name_regex=args.run_name_regex)
-    df_rm = collect_rule_metrics_best(runs)
+    df_rm = collect_rule_metrics_best(runs, min_dataset_coverage=args.min_rule_dataset_coverage)
     df_rm = filter_to_name_map_runs(add_derived_rule_metrics(df_rm))
     if df_rm.empty:
         return df_rm
@@ -856,6 +922,8 @@ def parse_args():
     ap.add_argument("--thr_step", type=float, default=0.01)
     ap.add_argument("--best_mode", type=str, default="tail@0.9")
     ap.add_argument("--rule_length_cap", type=int, default=30)
+    ap.add_argument("--min_rule_dataset_coverage", type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
+                    help="Minimum held-out dataset_coverage required before a rule contributes to HQ counts/plots. Use 0 to disable.")
     ap.add_argument("--run_name_regex", type=str, default=None,
                     help="Optional regex to filter which run folders to include.")
     return ap.parse_args()
