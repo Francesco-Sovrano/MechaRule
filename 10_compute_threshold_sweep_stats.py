@@ -294,8 +294,8 @@ def autc_pairs(pivot: pd.DataFrame, a: str, b: str, thresholds: Iterable[float])
         y_b = g2.loc[thresholds, b].to_numpy(dtype=float)
         if np.isnan(y_a).any() or np.isnan(y_b).any():
             continue
-        autc_a = float(np.trapezoid(y_a, x) / (x.max() - x.min()))
-        autc_b = float(np.trapezoid(y_b, x) / (x.max() - x.min()))
+        autc_a = float(np.trapz(y_a, x) / (x.max() - x.min()))
+        autc_b = float(np.trapz(y_b, x) / (x.max() - x.min()))
         rows.append({"task": task, "llm": llm, "A": autc_a, "B": autc_b, "diff": autc_a - autc_b})
     return pd.DataFrame(rows)
 
