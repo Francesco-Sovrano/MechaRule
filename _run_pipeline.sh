@@ -16,7 +16,8 @@ MIN_RULE_DATASET_COVERAGE="${MIN_RULE_DATASET_COVERAGE:-0.005}"
 #     [--batch_size <N>] \
 #     [--circuit_level <neuron|edge>] \
 #     [--circuit_size <N>] \
-#     [--min_flip_rate <R>]
+#     [--min_flip_rate <R>] \
+#     [--include_zero_scores]
 #
 # Defaults:
 #   --random_anchoring_plan --random_circuit_discovery --fast_anchoring --eval_intervention mean-positional --z_thresh -1 --max_number_of_circuits_to_analyze -1 --batch_size 256 --circuit_level neuron --circuit_size 100000 --min_flip_rate 0.2
@@ -56,6 +57,9 @@ Options (mutually exclusive within each group):
 		--min_flip_rate <R>
 							Minimum flip-rate threshold (tau) used in scripts 6 and 7.
 							Default: 0.2
+		--include_zero_scores
+							Pass --include_zero_scores through to 5_discover_circuits.py so
+							finite exact-zero scores are eligible for top-N neuron selection.
 	Plan:
 		--spectral_anchoring_plan
 		--random_anchoring_plan
@@ -130,6 +134,7 @@ BATCH_SIZE="256"
 CIRCUIT_LEVEL="neuron"
 CIRCUIT_SIZE="100000"
 MIN_FLIP_RATE="0.2"
+INCLUDE_ZERO_SCORES=false
 INCORRECT_RULES=false
 DECODE_ONLY=false
 NEURONS_TYPE="all"
@@ -179,6 +184,7 @@ while [[ $# -gt 0 ]]; do
 		--random_circuit_discovery)     DISCOVERY="random"; shift ;;
 		--fast_anchoring)               ANCHORING="fast"; shift ;;
 		--slow_anchoring)               ANCHORING="slow"; shift ;;
+		--include_zero_scores)          INCLUDE_ZERO_SCORES=true; shift ;;
 		--incorrect_rules)              INCORRECT_RULES=true; shift ;;
 		--mlp_neurons_only)						 NEURONS_TYPE='mlp'; shift ;;
 		--decode_only)                 DECODE_ONLY=true; shift ;;
@@ -220,6 +226,7 @@ echo "BATCH_SIZE:      $BATCH_SIZE"
 echo "CIRCUIT_LEVEL:   $CIRCUIT_LEVEL"
 echo "CIRCUIT_SIZE:    $CIRCUIT_SIZE"
 echo "MIN_FLIP_RATE:   $MIN_FLIP_RATE"
+echo "INCLUDE_ZERO_SCORES: $INCLUDE_ZERO_SCORES"
 echo "Z_THRESH:        $Z_THRESH"
 echo "EVAL_INTERVENTION: $EVAL_INTERVENTION"
 echo "MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE: $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
@@ -242,6 +249,11 @@ fi
 NEURONS_TYPE_FLAG=()
 if [[ "$NEURONS_TYPE" == "mlp" ]]; then
 	NEURONS_TYPE_FLAG=(--mlp_neurons_only)
+fi
+
+INCLUDE_ZERO_SCORES_FLAG=()
+if [[ "$INCLUDE_ZERO_SCORES" == "true" ]]; then
+	INCLUDE_ZERO_SCORES_FLAG=(--include_zero_scores)
 fi
 
 TASK_MODULE="lib.tasks.${EXPERIMENT_NAME}_task"
@@ -538,7 +550,8 @@ if [[ "$SPLITS" == "spectral" ]]; then
 		--global_n_clusters "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE" \
 		"${DECODE_FLAG[@]}" \
 		"${FAKE_FLAG[@]}" \
-		"${NEURONS_TYPE_FLAG[@]}"
+		"${NEURONS_TYPE_FLAG[@]}" \
+		"${INCLUDE_ZERO_SCORES_FLAG[@]}"
 else
 
 	if [[ "$DISCOVERY" == "spectral" ]]; then
@@ -565,7 +578,8 @@ else
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \
-			"${NEURONS_TYPE_FLAG[@]}"
+			"${NEURONS_TYPE_FLAG[@]}" \
+			"${INCLUDE_ZERO_SCORES_FLAG[@]}"
 	else
 		python3 5_discover_circuits.py \
 			--task_module "$TASK_MODULE" \
@@ -589,7 +603,8 @@ else
 			--max_n_of_rules_to_analyze $MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE \
 			"${DECODE_FLAG[@]}" \
 			"${FAKE_FLAG[@]}" \
-			"${NEURONS_TYPE_FLAG[@]}"
+			"${NEURONS_TYPE_FLAG[@]}" \
+			"${INCLUDE_ZERO_SCORES_FLAG[@]}"
 	fi
 fi
 

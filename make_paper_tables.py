@@ -55,7 +55,11 @@ TABLE2_RUNS = [
     "rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor-fake_targets",
 ]
 
-DEFAULT_THRESHOLDS = [0.75, 0.80, 0.85, 0.90, 0.95]
+DEFAULT_HQ_TEST_THRESHOLD = 0.70
+DEFAULT_HQ_ALL_FIT_THRESHOLD = 0.70
+# Backward-compatible alias: the primary/held-out threshold.
+DEFAULT_HQ_THRESHOLD = DEFAULT_HQ_TEST_THRESHOLD
+DEFAULT_THRESHOLDS = [0.70, 0.75, 0.80, 0.85, 0.90]
 DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
 DEFAULT_TABLE3_BINS = [0.2, 0.3, 0.5, 1.0]
 
@@ -588,36 +592,73 @@ def _directional_union_rate_from_hq_coverage(
     hq: Dict[str, Any],
     direction: str,
     coverage_source: str,
+    score_scope: str = "test",
 ) -> float:
-    """Return Table 1's direction-specific union flip rate.
+    """Return Table 1's direction-specific eligible union flip rate.
 
     The numerator is a unique union over prompts, so a prompt flipped by several
-    neurons is counted once.  The denominator must be direction-specific:
-    1->0 is normalized by baseline-positive/correct examples, and 0->1 is
-    normalized by baseline-negative/incorrect examples.  This differs from the
-    legacy `flip_stats_global.json` rates, which are normalized by all evaluated
-    rows and therefore understate directional coverage when the baseline labels
-    are imbalanced.
+    neurons is counted once. The denominator is direction-specific: 1->0 is
+    normalized by evaluated baseline-correct examples, and 0->1 is normalized by
+    evaluated baseline-incorrect examples. This intentionally differs from
+    legacy ``flip_stats_global.json`` rates, which are normalized by all
+    evaluated rows and therefore understate directional coverage when the
+    baseline labels are imbalanced.
+
+    Newer Stage-7 artifacts store these quantities under
+    ``score_scopes.<scope>``. Older artifacts stored them in top-level
+    ``flip_c2i``/``flip_i2c`` blocks. This reader supports both and only falls
+    back to legacy all-row rates when no eligible-denominator metadata exists.
 
     With ``coverage_source="all"``, the numerator uses all localized
-    rule-bearing neurons.  With ``coverage_source="hq"``, it uses only neurons
-    that pass the high-quality rule threshold.
+    rule-bearing neurons in the requested scope. With ``coverage_source="hq"``,
+    it uses only neurons whose rule score reaches the HQ threshold.
     """
-    section_name = "flip_c2i" if direction == "c2i" else "flip_i2c"
-    section = hq.get(section_name) if isinstance(hq, dict) else None
-    if not isinstance(section, dict):
+    if not isinstance(hq, dict):
         return float("nan")
 
-    rate_key = "eligible_union_rate_high" if coverage_source == "hq" else "eligible_union_rate_all"
-    rate = _safe_float(section.get(rate_key))
-    if rate == rate:
-        return rate
+    scope = _normalize_score_scope(score_scope)
+    section_name = "flip_c2i" if direction == "c2i" else "flip_i2c"
+    denom_key = "n_eval_baseline_correct" if direction == "c2i" else "n_eval_baseline_incorrect"
 
-    numerator_key = "union_high" if coverage_source == "hq" else "union_all"
-    numerator = _safe_float(section.get(numerator_key))
-    denominator = _safe_float(section.get("eligible_baseline_count"))
-    if numerator == numerator and denominator == denominator and denominator > 0:
-        return numerator / denominator
+    # Preferred scoped artifact produced by current Stage 7.
+    scoped = hq.get("score_scopes")
+    if isinstance(scoped, dict):
+        rec = scoped.get(scope) or scoped.get(scope.replace("_", "+"))
+        if isinstance(rec, dict):
+            denom_payload = rec.get("eligible_denominators") or {}
+            denom = _safe_float(denom_payload.get(denom_key)) if isinstance(denom_payload, dict) else float("nan")
+            sec = rec.get(section_name) if isinstance(rec.get(section_name), dict) else {}
+            if coverage_source == "hq":
+                numerator = _safe_float(sec.get("union_high"))
+                # Ratios are high-neuron prevalence ratios in scoped artifacts.
+                ratios = rec.get("ratios") if isinstance(rec.get("ratios"), dict) else {}
+                ratio_key = "prevalence_c2i" if direction == "c2i" else "prevalence_i2c"
+                ratio_payload = ratios.get(ratio_key) if isinstance(ratios.get(ratio_key), dict) else {}
+                if numerator != numerator and ratio_payload:
+                    pct = _safe_float(ratio_payload.get("percent"))
+                    if pct == pct:
+                        return pct / 100.0
+            else:
+                all_scope = rec.get("all_rule_bearing_in_scope") if isinstance(rec.get("all_rule_bearing_in_scope"), dict) else {}
+                numerator = _safe_float(all_scope.get("union_c2i" if direction == "c2i" else "union_i2c"))
+                if numerator != numerator:
+                    numerator = _safe_float(sec.get("union_all_in_scope"))
+            if numerator == numerator and denom == denom and denom > 0:
+                return numerator / denom
+
+    # Legacy top-level artifact.
+    section = hq.get(section_name)
+    if isinstance(section, dict):
+        rate_key = "eligible_union_rate_high" if coverage_source == "hq" else "eligible_union_rate_all"
+        rate = _safe_float(section.get(rate_key))
+        if rate == rate:
+            return rate
+
+        numerator_key = "union_high" if coverage_source == "hq" else "union_all"
+        numerator = _safe_float(section.get(numerator_key))
+        denominator = _safe_float(section.get("eligible_baseline_count"))
+        if numerator == numerator and denominator == denominator and denominator > 0:
+            return numerator / denominator
 
     return float("nan")
 
@@ -678,8 +719,6 @@ def _score_scope_label(scope: str) -> str:
 
 def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str = "test") -> pd.DataFrame:
     """Keep rows for a requested scoring scope.
-
-    TEST is the primary held-out metric. ALL-FIT is a descriptive score for a separate final-fit combo selected and scored on all rows. TRAIN rows are never included unless explicitly requested.
     """
     if df is None or df.empty:
         return df
@@ -1007,9 +1046,6 @@ def _scope_specific_metric_paths(stats_dir: Path, score_scope: str) -> Tuple[Pat
 
 def _load_best_rule_metrics(stats_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scope: str = "test", scores_df: pd.DataFrame = None) -> pd.DataFrame:
     """Load one rule-combo row per localized neuron for the requested scope.
-
-    ``score_scope='test'`` is the held-out score and remains the primary paper
-    metric. ``score_scope='all_fit'`` is descriptive: a separate final-fit combo selected and scored on all available rows.
     """
     score_scope = _normalize_score_scope(score_scope)
     scoped_all_path, scoped_best_path = _scope_specific_metric_paths(stats_dir, score_scope)
@@ -1073,23 +1109,67 @@ def _load_best_rule_metrics(stats_dir: Path, min_dataset_coverage: float = DEFAU
 def _load_eval_best_rule_metrics(stats_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
     return _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope="test")
 
+def _metric_scope_artifacts_available(stats_dir: Path, score_scope: str) -> bool:
+    """Return True if metrics for ``score_scope`` are present, even if no row is HQ.
+
+    This prevents missing ALL-FIT generation from being reported as a scientific
+    zero in paper tables. Scoped CSVs are preferred; the combined all-scopes CSV
+    is accepted only if it actually contains the requested scope.
+    """
+    scope = _normalize_score_scope(score_scope)
+    scoped_all, scoped_best = _scope_specific_metric_paths(stats_dir, scope)
+    if scoped_all.exists() or scoped_best.exists():
+        return True
+    all_scopes = stats_dir / "rule_combo_metrics_all_scopes.csv"
+    if not all_scopes.exists():
+        return False
+    try:
+        header = pd.read_csv(all_scopes, nrows=0)
+        cols = set(header.columns)
+        scope_col = "score_scope" if "score_scope" in cols else "computed_on" if "computed_on" in cols else None
+        if scope_col is None:
+            return scope == "test"
+        vals = pd.read_csv(all_scopes, usecols=[scope_col], low_memory=False)[scope_col].map(_normalize_score_scope)
+        return bool((vals == scope).any())
+    except Exception:
+        return False
+
+
+def _threshold_for_score_scope(score_scope: str, hq_test_threshold: float = DEFAULT_HQ_TEST_THRESHOLD, hq_all_fit_threshold: float = DEFAULT_HQ_ALL_FIT_THRESHOLD) -> float:
+    scope = _normalize_score_scope(score_scope)
+    return float(hq_all_fit_threshold) if scope == "all_fit" else float(hq_test_threshold)
+
+
 def _count_hq_for_scope(stats_dir: Path, score_scope: str, threshold: float, min_dataset_coverage: float, scores_df: pd.DataFrame = None) -> Any:
-    df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope, scores_df=scores_df)
+    scope = _normalize_score_scope(score_scope)
+    available = _metric_scope_artifacts_available(stats_dir, scope)
+    df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=scope, scores_df=scores_df)
     if df.empty:
-        # Empty can mean either unavailable or truly zero; for legacy test scope
-        # this is a legitimate zero, while all-fit requires newly generated
-        # scope-specific artifacts.
-        if _normalize_score_scope(score_scope) == "train+test":
-            scoped_all, scoped_best = _scope_specific_metric_paths(stats_dir, score_scope)
-            if not scoped_all.exists() and not scoped_best.exists() and not (stats_dir / "rule_combo_metrics_all_scopes.csv").exists():
-                return pd.NA
+        # TEST may legitimately have zero qualifying rows in legacy outputs.
+        # ALL-FIT, however, is a separate generated diagnostic; missing scoped
+        # artifacts should appear as missing, not as zero.
+        if scope == "all_fit" and not available:
+            print(f"[table] warning: missing ALL-FIT metric artifacts in {stats_dir}; reporting NA, not 0.")
+            return pd.NA
         return 0
     return int((pd.to_numeric(df.get("MCC"), errors="coerce") >= float(threshold)).sum())
 
 
-def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS, coverage_source: str = "all", min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scopes: Sequence[str] = ("test", "all_fit")) -> pd.DataFrame:
+def _table1(
+    data_root: Path,
+    out_dir: Path,
+    run_name: str = MAIN_RUN,
+    tasks: Optional[Sequence[str]] = DEFAULT_MAIN_TASKS,
+    coverage_source: str = "all",
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scopes: Sequence[str] = ("test", "all_fit"),
+    hq_test_threshold: float = DEFAULT_HQ_TEST_THRESHOLD,
+    hq_all_fit_threshold: float = DEFAULT_HQ_ALL_FIT_THRESHOLD,
+    coverage_score_scope: str = "all_fit",
+) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     score_scopes = [_normalize_score_scope(s) for s in score_scopes]
+    coverage_score_scope = _normalize_score_scope(coverage_score_scope)
     for model_root in _find_model_roots(data_root, tasks=tasks):
         stats_dir = _resolve_stats_dir(model_root, run_name)
         scores_df_scope = None
@@ -1112,21 +1192,21 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
         # direction, not the total number of evaluated rows.  The HQ coverage
         # artifact stores the required eligible denominators for both the
         # all-neuron and HQ-only numerators.
-        c2i_share = _directional_union_rate_from_hq_coverage(hq, "c2i", coverage_source)
-        i2c_share = _directional_union_rate_from_hq_coverage(hq, "i2c", coverage_source)
+        c2i_share = _directional_union_rate_from_hq_coverage(hq, "c2i", coverage_source, coverage_score_scope)
+        i2c_share = _directional_union_rate_from_hq_coverage(hq, "i2c", coverage_source, coverage_score_scope)
 
         if c2i_share != c2i_share:
             c2i_share = _extract_flip_share_from_global(flip_global, "c2i")
             if c2i_share == c2i_share:
                 print(
-                    f"[table1] warning: {model_root} lacks direction-specific 1->0 "
+                    f"[table1] warning: {model_root} lacks scoped eligible 1->0 "
                     "coverage metadata; using legacy all-row denominator fallback."
                 )
         if i2c_share != i2c_share:
             i2c_share = _extract_flip_share_from_global(flip_global, "i2c")
             if i2c_share == i2c_share:
                 print(
-                    f"[table1] warning: {model_root} lacks direction-specific 0->1 "
+                    f"[table1] warning: {model_root} lacks scoped eligible 0->1 "
                     "coverage metadata; using legacy all-row denominator fallback."
                 )
 
@@ -1145,7 +1225,8 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
         for scope in score_scopes:
             label = _score_scope_label(scope)
             col = "HQ test" if scope == "test" else f"HQ {label}"
-            row[col] = _count_hq_for_scope(stats_dir, scope, 0.85, min_dataset_coverage, scores_df=scores_df_scope)
+            scope_threshold = _threshold_for_score_scope(scope, hq_test_threshold, hq_all_fit_threshold)
+            row[col] = _count_hq_for_scope(stats_dir, scope, scope_threshold, min_dataset_coverage, scores_df=scores_df_scope)
         # Backward-compatible column expected by older papers/scripts.
         if "HQ test" in row:
             row["HQ"] = row["HQ test"]
@@ -1172,9 +1253,9 @@ def _table1(data_root: Path, out_dir: Path, run_name: str = MAIN_RUN, tasks: Opt
     df = df[ordered]
     caption = (
         "Table 1: End-to-end rule split + spectral coverage results. # Loc. counts all rule-bearing localized neurons; "
-        f"HQ test counts held-out MCC >= 0.85 and dataset coverage >= {float(min_dataset_coverage):.3g}; "
-        "HQ all-fit is descriptive for the same frozen train-selected combos scored on train plus held-out rows. "
-        "Directional union flip coverage is normalized by eligible source examples and includes all rule-bearing localized neurons."
+        f"HQ test counts held-out MCC >= {float(hq_test_threshold):.2g} and dataset coverage >= {float(min_dataset_coverage):.3g}; "
+        f"HQ all-fit counts final-fit rule combos with MCC >= {float(hq_all_fit_threshold):.2g}, selected and scored on all available observed rows. "
+        f"Directional union flip coverage is normalized by eligible source examples in the {coverage_score_scope} scope and includes all rule-bearing localized neurons."
         if coverage_source != "hq"
         else "Table 1: High-quality neuron-anchored rules and HQ-only directional flip coverage, normalized by eligible source examples."
     )
@@ -1239,7 +1320,7 @@ def _table2(data_root: Path, out_dir: Path, thresholds: Sequence[float], run_nam
                 row[f"t = {t:.2f}"] = int(vals.sum()) if vals.notna().any() else pd.NA
             wide_rows.append(row)
     wide_df = pd.DataFrame(wide_rows)
-    _write_table_artifacts(wide_df, out_dir, "table2_threshold_sweep_totals", caption=f"Table 2: Total number of MCC-qualified neurons (MCC ≥ t and dataset coverage ≥ {float(min_dataset_coverage):.3g}) summed over all available task/model runs. TEST is held-out; ALL-FIT is descriptive final-fit selected and scored on all rows.")
+    _write_table_artifacts(wide_df, out_dir, "table2_threshold_sweep_totals", caption=f"Table 2: Total number of MCC-qualified neurons (MCC ≥ t and dataset coverage ≥ {float(min_dataset_coverage):.3g}) summed over all available task/model runs. TEST is held-out; ALL-FIT is final-fit selected and scored on all rows.")
 
     # Also write one compact table per score scope for easy inclusion.
     for scope in score_scopes:
@@ -2306,7 +2387,11 @@ def main():
     ap.add_argument("--table13_baseline_scope", type=str, default="both", choices=["both", "positive", "negative", "selected"], help="Baseline regimes used for Table 13 cross-task overlap. Default 'both' matches the paper's all-localized-neuron overlap; 'selected' uses --baseline_subset.")
     ap.add_argument("--baseline_subset", type=str, default="positive_baseline", choices=["positive_baseline", "negative_baseline"])
     ap.add_argument("--table1_coverage_source", type=str, default="all", choices=["all", "hq"], help="Table 1 flip coverage numerator: all rule-bearing localized neurons (paper default) or HQ-only neurons. Directional rates are normalized by eligible source examples.")
-    ap.add_argument("--score_scopes", type=str, default="test,all_fit", help="Comma-separated score scopes for HQ reporting. Default reports held-out test and descriptive all-fit scores selected and scored on all rows.")
+    ap.add_argument("--table1_coverage_score_scope", type=str, default="all_fit", help="Score/data scope used for Table 1 directional flip coverage; default is all-fit/all observed rows.")
+    ap.add_argument("--hq_test_threshold", type=float, default=DEFAULT_HQ_TEST_THRESHOLD, help="MCC threshold for held-out/test HQ counts in Table 1. Default: 0.70.")
+    ap.add_argument("--hq_all_fit_threshold", type=float, default=DEFAULT_HQ_ALL_FIT_THRESHOLD, help="MCC threshold for all-fit HQ counts in Table 1. Default: 0.70.")
+    ap.add_argument("--hq_threshold", type=float, default=None, help="Deprecated alias for --hq_test_threshold. ALL-FIT remains controlled by --hq_all_fit_threshold.")
+    ap.add_argument("--score_scopes", type=str, default="test,all_fit", help="Comma-separated score scopes for HQ reporting. Default reports held-out test and all-fit scores selected and scored on all rows.")
     ap.add_argument("--min_rule_dataset_coverage", type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE, help="Minimum dataset_coverage required before a rule contributes to HQ counts or threshold sweeps. Use 0 to disable.")
     ap.add_argument("--include_hans_in_main_tables", action="store_true", help="Include HANS/NLI in Tables 1-3/12 when matching compatible artifacts exist. The paper main tables omit HANS.")
     ap.add_argument("--table3_scope", type=str, default="all", choices=["all", "selected"], help="Table 3 scope. 'all' reproduces the paper compact table; 'selected' honors --table3_task/--table3_model/--baseline_subset.")
@@ -2342,11 +2427,23 @@ def main():
     if not score_scopes:
         score_scopes = ["test", "all_fit"]
     bins = _parse_bins(args.table3_bins)
+    hq_test_threshold = float(args.hq_threshold) if args.hq_threshold is not None else float(args.hq_test_threshold)
+    hq_all_fit_threshold = float(args.hq_all_fit_threshold)
 
     results: Dict[str, Any] = {}
 
     if "table1" in which:
-        df = _table1(data_root, out_root, tasks=main_table_tasks, coverage_source=args.table1_coverage_source, min_dataset_coverage=args.min_rule_dataset_coverage, score_scopes=score_scopes)
+        df = _table1(
+            data_root,
+            out_root,
+            tasks=main_table_tasks,
+            coverage_source=args.table1_coverage_source,
+            min_dataset_coverage=args.min_rule_dataset_coverage,
+            score_scopes=score_scopes,
+            hq_test_threshold=hq_test_threshold,
+            hq_all_fit_threshold=hq_all_fit_threshold,
+            coverage_score_scope=args.table1_coverage_score_scope,
+        )
         results["table1_rows"] = int(len(df))
         print(df.to_string(index=False) if not df.empty else "[table1] no rows")
 

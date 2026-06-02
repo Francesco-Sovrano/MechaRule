@@ -123,4 +123,16 @@ python3 summarize_intervention_shift.py \
   --baseline_label "${BASELINE_INTERVENTION}" \
   --candidate_label "${INTERVENTION}" \
   --task_name "${TASK_MODULE}" \
-  --model_name "${MODEL_ID}"
+  --model_name "${MODEL_ID}" \
+  --hq_score_scope test
+
+python3 summarize_intervention_shift.py \
+  --baseline_dir "${BASELINE_STATS_DIR}" \
+  --candidate_dir "${CANDIDATE_STATS_DIR}" \
+  --output_csv "${INTERVENTION_SHIFT_DIR}/all_fit/intervention_shift_summary_all_fit.csv" \
+  --output_dir "${INTERVENTION_SHIFT_DIR}/all_fit" \
+  --baseline_label "${BASELINE_INTERVENTION}" \
+  --candidate_label "${INTERVENTION}" \
+  --task_name "${TASK_MODULE}" \
+  --model_name "${MODEL_ID}" \
+  --hq_score_scope all_fit

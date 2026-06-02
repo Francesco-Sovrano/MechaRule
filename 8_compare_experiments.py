@@ -917,7 +917,7 @@ def parse_args():
                     help="Where to write CSVs and plots. If multiple stats folders are found, per-task aggregates are written here.")
     ap.add_argument("--rule_quality_metric", type=str, default="mcc",
                     choices=["mcc", "f1", "balanced_accuracy", "tpr", "tnr"])
-    ap.add_argument("--thr_min", type=float, default=0.85)
+    ap.add_argument("--thr_min", type=float, default=0.70)
     ap.add_argument("--thr_max", type=float, default=0.99)
     ap.add_argument("--thr_step", type=float, default=0.01)
     ap.add_argument("--best_mode", type=str, default="tail@0.9")

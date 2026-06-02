@@ -4,21 +4,12 @@ Compute statistically valid E1/E3 method comparisons in one script.
 
 This script replaces the old threshold-as-sample analysis.
 
-What is valid here:
-  1. Threshold sweeps are descriptive only.
-  2. Primary inference uses one paired value per independent unit: (task, model).
-  3. The primary threshold endpoint uses a single predeclared MCC threshold.
-  4. AUTC summarizes the threshold sweep into one scalar per (task, model).
-  5. Optional sample-based analysis compares per-neuron MCC distributions with
-     equal-size resampling within matched (task, model) units and cluster
-     bootstrap CIs over units.
-
 Typical use:
   python3 10_compute_threshold_sweep_stats.py \
     --csv paper_tables/table2_threshold_sweep_per_run_long.csv \
     --data-root ./data \
     --out_dir paper_tables/stats \
-    --primary_threshold 0.85 \
+    --primary_threshold 0.70 \
     --sample-stat mean \
     --n-boot 10000
 """
@@ -122,7 +113,7 @@ except Exception:  # pragma: no cover - useful when only threshold CSV analysis 
     _load_best_rule_metrics = None
 
 
-DEFAULT_THRESHOLDS = [0.75, 0.80, 0.85, 0.90]
+DEFAULT_THRESHOLDS = [0.70, 0.75, 0.80, 0.85, 0.90]
 
 LABEL_MAP = {
     "Rule split w/ Spectral anchoring plan": "Rule split + spectral coverage",
@@ -681,8 +672,9 @@ def main() -> None:
     ap.add_argument("--csv", required=True, help="Path to table2_threshold_sweep_per_run_long.csv")
     ap.add_argument("--metric", default="n_high_quality_neurons")
     ap.add_argument("--thresholds", nargs="*", type=float, default=DEFAULT_THRESHOLDS)
-    ap.add_argument("--primary_threshold", type=float, default=0.85)
-    ap.add_argument("--score-scope", default="both", choices=["test", "all_fit", "both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' writes/prints held-out TEST and descriptive ALL-FIT results separately.")
+    ap.add_argument("--primary_threshold", type=float, default=0.70, help="Primary held-out/test MCC threshold. Default: 0.70.")
+    ap.add_argument("--primary_threshold_all_fit", type=float, default=0.70, help="Primary all-fit MCC threshold. Default: 0.70.")
+    ap.add_argument("--score-scope", default="both", choices=["test", "all_fit", "both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' writes/prints held-out TEST and ALL-FIT results separately.")
     ap.add_argument("--alt", choices=["two-sided", "greater", "less"], default="greater", help="Alternative for A-B.")
     ap.add_argument("--out_dir", default=None, help="Optional output directory for CSV artifacts.")
     ap.add_argument("--seed", type=int, default=0)
@@ -714,8 +706,6 @@ def main() -> None:
         print(f"\n##############################")
         print(f"# Score scope: {scope.upper()}")
         print(f"##############################")
-        if scope == "all_fit":
-            print("Note: ALL-FIT scores are descriptive final-fit metrics selected/scored on all evaluated rows; use TEST for strict generalization.")
 
         pivot = load_pivot(args.csv, args.metric, score_scope=scope)
         if pivot.empty or len(pivot.columns) == 0:
@@ -729,17 +719,18 @@ def main() -> None:
         print(coverage_report(pivot).to_string(index=False))
 
         totals, ns = make_table_sum(pivot, thresholds=thresholds)
-        print("\n== Descriptive threshold-sweep totals; do not use as inferential replicates ==")
+        print("\n== HQ ==")
         print(totals.apply(lambda col: col.map(_fmt)).to_string())
-        print("\n== N independent task/model runs contributing to each total ==")
+        print("\n== Number of contributing task/model runs per threshold ==")
         print(ns.to_string())
-        print("\n== LaTeX tabular for descriptive Table 2 ==")
+        print("\n== LaTeX tabular for Table 2 ==")
         print(to_latex_tabular(totals))
 
+        primary_threshold_scope = float(args.primary_threshold_all_fit) if scope == "all_fit" else float(args.primary_threshold)
         primary, autc, primary_pairs, autc_pairs_df = run_threshold_comparisons(
             pivot,
             comparisons=COMPARISONS,
-            primary_threshold=args.primary_threshold,
+            primary_threshold=primary_threshold_scope,
             thresholds=thresholds,
             alternative=args.alt,
             seed=args.seed,
@@ -755,7 +746,7 @@ def main() -> None:
         ]
         cols_no_scope = [c for c in cols if c != "score_scope"]
 
-        print(f"\n== Primary exact paired tests at MCC threshold {args.primary_threshold:.2f} ==")
+        print(f"\n== Primary exact paired tests at MCC threshold {primary_threshold_scope:.2f} ==")
         if primary.empty:
             print("No complete paired comparisons found.")
         else:
@@ -791,7 +782,7 @@ def main() -> None:
                 print(f"No per-neuron score rows found for score scope {scope!r}. Check --data-root and run artifact paths.")
             else:
                 scores.insert(0, "score_scope", scope)
-                per_unit = per_unit_metrics(scores, threshold=args.primary_threshold)
+                per_unit = per_unit_metrics(scores, threshold=primary_threshold_scope)
                 if not per_unit.empty:
                     per_unit.insert(0, "score_scope", scope)
                 comp = run_sample_comparisons(
@@ -799,7 +790,7 @@ def main() -> None:
                     per_unit=per_unit,
                     comparisons=COMPARISONS,
                     stat_name=args.sample_stat,
-                    threshold=args.primary_threshold,
+                    threshold=primary_threshold_scope,
                     sample_size=sample_size,
                     n_boot=args.n_boot,
                     alternative=args.alt,

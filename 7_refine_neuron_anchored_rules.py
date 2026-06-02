@@ -43,6 +43,21 @@ from lib.neuron_intervention import (
 	get_correctness_cached_by_prefix_batches,
 )
 
+# Must match lib.data_model_for_shap.ALL_FIT_CACHE_SIGNATURE.
+# Cached ALL-FIT files without this token are from older semantics and are recomputed.
+ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
+
+def _all_fit_combo_cache_current(path: Path) -> bool:
+	if (not path.exists()) or path.stat().st_size <= 0:
+		return False
+	try:
+		df = pd.read_csv(path, nrows=1)
+	except Exception:
+		return False
+	if df.empty or "all_fit_cache_signature" not in df.columns:
+		return False
+	return str(df.loc[0, "all_fit_cache_signature"]) == ALL_FIT_CACHE_SIGNATURE
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -411,9 +426,17 @@ def parse_args():
 	ap.add_argument(
 		"--rule_quality_threshold",
 		type=float,
-		default=0.85,
+		default=0.70,
 		help=(
-			"Threshold applied to --rule_quality_metric to count/plot 'high-quality' neurons. "
+			"Held-out TEST threshold applied to --rule_quality_metric to count/plot high-quality neurons. Default: 0.70. "
+		),
+	)
+	ap.add_argument(
+		"--rule_quality_threshold_all_fit",
+		type=float,
+		default=0.70,
+		help=(
+			"Descriptive ALL-FIT threshold applied to --rule_quality_metric. Default: 0.70. "
 		),
 	)
 	ap.add_argument(
@@ -435,6 +458,15 @@ def parse_args():
 			"Do not compute descriptive ALL-FIT rule combos. By default, Stage 7 emits "
 			"rule_combo_all_fit_<target>.csv selected and scored on all available rows; "
 			"these are descriptive only and are not held-out HQ scores."
+		),
+	)
+	ap.add_argument(
+		"--force_all_fit_recompute",
+		action="store_true",
+		help=(
+			"Regenerate rule_combo_all_fit_<target>.csv artifacts using cached upstream data "
+			"where possible. This is useful after fixing ALL-FIT semantics without "
+			"rerunning ablations/interventions."
 		),
 	)
 	ap.set_defaults(emit_all_fit_rules=True)
@@ -887,6 +919,7 @@ def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targ
 		"only_unique_datapoints_in_rule_extraction": bool(getattr(args, "only_unique_datapoints_in_rule_extraction", False)),
 		"semantic_quality_policy": str(getattr(args, "semantic_quality_policy", "none")),
 		"emit_all_fit_rules": bool(getattr(args, "emit_all_fit_rules", True)),
+		"all_fit_cache_signature_expected": ALL_FIT_CACHE_SIGNATURE,
 	}
 
 	input_feature_names = list(map(str, input_features))
@@ -903,7 +936,7 @@ def build_rule_extraction_signature(rules_df: pd.DataFrame, input_features, targ
 def _rule_signature_path(rules_subdir):
 	return Path(rules_subdir) / "_rule_extraction_signature.json"
 
-def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=None, force_recompute: bool = False, require_all_fit: bool = True, targets=None):
+def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=None, force_recompute: bool = False, require_all_fit: bool = True, targets=None, force_all_fit_recompute: bool = False):
 	"""Skip only when every required raw output exists and signature matches.
 
 	Required raw outputs are rule_combo_train_<target>.csv and rule_combo_<target>.csv
@@ -917,18 +950,26 @@ def should_skip_rule_extraction(rules_subdir, prefix, layer_label, signature=Non
 	if targets is None:
 		targets = [f"{prefix}{layer_label}"]
 	missing = []
+	stale_all_fit = []
 	for target in targets:
-		required = [
+		base_required = [
 			rules_path / f"rule_combo_train_{target}.csv",
 			rules_path / f"rule_combo_{target}.csv",
 		]
-		if require_all_fit:
-			required.append(rules_path / f"rule_combo_all_fit_{target}.csv")
-		for fp in required:
+		for fp in base_required:
 			if (not fp.exists()) or fp.stat().st_size <= 0:
 				missing.append(fp.name)
+		if require_all_fit:
+			all_fit_fp = rules_path / f"rule_combo_all_fit_{target}.csv"
+			if not _all_fit_combo_cache_current(all_fit_fp):
+				stale_all_fit.append(all_fit_fp.name)
 	if missing:
 		print(f"[Rules] Cache incomplete in {rules_path}: missing {missing[:6]}{'...' if len(missing) > 6 else ''}")
+		return False
+	if stale_all_fit:
+		print(f"[Rules] ALL-FIT cache missing/stale in {rules_path}: {stale_all_fit[:6]}{'...' if len(stale_all_fit) > 6 else ''}")
+		return False
+	if force_all_fit_recompute:
 		return False
 	if signature is None:
 		return True
@@ -2068,6 +2109,16 @@ def _rule_metric_col(metric: str) -> str:
 def _rule_metric_label(metric: str) -> str:
 	return _RULE_METRIC_SPECS[_norm_rule_metric_name(metric)][1]
 
+def _norm_rule_quality_scope(scope) -> str:
+	sv = str(scope or "test").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+	if sv in ("all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "train+test", "traintest"):
+		return "all_fit"
+	if sv in ("eval", "heldout", "held+out", "test"):
+		return "test"
+	if sv.startswith("train"):
+		return "train"
+	return sv
+
 def write_rule_metrics_stats(
 	rules_dir: str,
 	out_dir: str,
@@ -2077,6 +2128,7 @@ def write_rule_metrics_stats(
 	length_cap: int = 30,
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	quality_thresholds_by_scope: dict = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	neurons_sorted=None,  # <-- NEW
 	scores_df: pd.DataFrame = None,
@@ -2120,7 +2172,14 @@ def write_rule_metrics_stats(
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
 	metric_label = _rule_metric_label(metric_key)
-	thr = float(quality_threshold)
+	base_thr = 0.70 if quality_threshold is None else float(quality_threshold)
+	thresholds_by_scope = {"test": base_thr, "all_fit": 0.70}
+	if isinstance(quality_thresholds_by_scope, dict):
+		for _scope, _thr in quality_thresholds_by_scope.items():
+			try:
+				thresholds_by_scope[_norm_rule_quality_scope(_scope)] = float(_thr)
+			except Exception:
+				pass
 	# If the requested metric isn't present in the artifacts, fall back to MCC.
 	if metric_col not in df_all.columns:
 		metric_key = "mcc"
@@ -2128,14 +2187,7 @@ def write_rule_metrics_stats(
 		metric_label = "MCC"
 
 	def _norm_scope(scope):
-		sv = str(scope or "test").strip().lower().replace("_", "+").replace(" ", "")
-		if sv in ("eval", "heldout", "held+out", "test"):
-			return "test"
-		if sv in ("all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data"):
-			return "all_fit"
-		if sv.startswith("train"):
-			return "train"
-		return sv
+		return _norm_rule_quality_scope(scope)
 
 	def _scope_slug(scope):
 		return _norm_scope(scope).replace("+", "_").replace("-", "_")
@@ -2228,6 +2280,7 @@ def write_rule_metrics_stats(
 			df_top.to_csv(legacy_top, index=False)
 			print(f"[RuleMetrics] Wrote {legacy_top}")
 
+		thr = float(thresholds_by_scope.get(scope, base_thr))
 		high = df_best[pd.to_numeric(df_best[metric_col], errors="coerce") >= float(thr)]
 		summary = {
 			"score_scope": scope,
@@ -2386,6 +2439,7 @@ def write_high_quality_neuron_flip_coverage(
 	# Backward-compat default; if quality_threshold is None we fall back to this.
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	quality_thresholds_by_scope: dict = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	baseline_metric_col: str = None,
 ):
@@ -2417,13 +2471,21 @@ def write_high_quality_neuron_flip_coverage(
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
 	metric_label = _rule_metric_label(metric_key)
-	thr = float(quality_threshold)
+	base_thr = 0.70 if quality_threshold is None else float(quality_threshold)
+	thresholds_by_scope = {"test": base_thr, "all_fit": 0.70}
+	if isinstance(quality_thresholds_by_scope, dict):
+		for _scope, _thr in quality_thresholds_by_scope.items():
+			try:
+				thresholds_by_scope[_norm_rule_quality_scope(_scope)] = float(_thr)
+			except Exception:
+				pass
 	# If the requested metric isn't present in the artifacts, fall back to MCC.
 	if metric_col not in rule_best_df.columns:
 		metric_key = "mcc"
 		metric_col = "MCC"
 		metric_label = "MCC"
 
+	thr = float(thresholds_by_scope.get("test", base_thr))
 	tmp = rule_best_df.copy()
 	tmp["layer_key"] = tmp["layer_key"].map(_safe_layer_label)  # <- critical
 	high_df = tmp[pd.to_numeric(tmp[metric_col], errors="coerce") >= float(thr)]
@@ -2518,7 +2580,8 @@ def write_high_quality_neuron_flip_coverage(
 	summary = {
 		"quality_metric": str(metric_key),
 		"quality_metric_label": str(metric_label),
-		"quality_threshold": float(thr),
+		"quality_threshold": float(thresholds_by_scope.get("test", base_thr)),
+		"quality_thresholds_by_scope": {k: float(v) for k, v in thresholds_by_scope.items()},
 		"min_dataset_coverage": float(min_dataset_coverage),
 		# Keep legacy field for backward compatibility.
 		"n_neurons_total": int(len(total_neurons)),
@@ -2984,7 +3047,7 @@ def write_high_quality_neuron_flip_coverage_by_layer(
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
 	metric_label = _rule_metric_label(metric_key)
-	thr = float(quality_threshold)
+	thr = 0.70 if quality_threshold is None else float(quality_threshold)
 	if metric_col not in rule_best_df.columns:
 		metric_key = "mcc"
 		metric_col = "MCC"
@@ -3230,7 +3293,8 @@ def _hq_scope_records(
 	rule_dfs_by_scope: dict,
 	quality_metric: str,
 	quality_threshold: float,
-	min_dataset_coverage: float,
+	quality_thresholds_by_scope: dict = None,
+	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	baseline_metric_col: str = None,
 ):
 	"""Build all-neuron and scope-specific HQ flip-coverage records.
@@ -3248,7 +3312,14 @@ def _hq_scope_records(
 	metric_key = _norm_rule_metric_name(quality_metric)
 	metric_col = _rule_metric_col(metric_key)
 	metric_label = _rule_metric_label(metric_key)
-	thr = float(quality_threshold)
+	base_thr = 0.70 if quality_threshold is None else float(quality_threshold)
+	thresholds_by_scope = {"test": base_thr, "all_fit": 0.70}
+	if isinstance(quality_thresholds_by_scope, dict):
+		for _scope, _thr in quality_thresholds_by_scope.items():
+			try:
+				thresholds_by_scope[_norm_rule_quality_scope(_scope)] = float(_thr)
+			except Exception:
+				pass
 
 	def _cols(neuron_list, prefix):
 		return [f"{prefix}{lk}_{nid}" for (lk, nid) in neuron_list]
@@ -3340,7 +3411,8 @@ def _hq_scope_records(
 			continue
 		tmp = rdf2.copy()
 		tmp["layer_key"] = tmp["layer_key"].map(_safe_layer_label)
-		high_df = tmp[pd.to_numeric(tmp[mcol], errors="coerce") >= thr]
+		scope_thr = float(thresholds_by_scope.get(scope_norm, base_thr))
+		high_df = tmp[pd.to_numeric(tmp[mcol], errors="coerce") >= scope_thr]
 		high_ids = {(str(r["layer_key"]), int(r["neuron_id"])) for _, r in high_df.dropna(subset=["neuron_id", "layer_key"]).iterrows()}
 		high_neurons = [t for t in total_neurons if (t[0], t[1]) in high_ids]
 		scope_scores = _scores_for_scope(scope_norm)
@@ -3350,6 +3422,7 @@ def _hq_scope_records(
 		cov.update({
 			"score_scope": scope_norm,
 			"score_scope_label": "TEST" if scope_norm == "test" else "ALL-FIT",
+			"quality_threshold": float(scope_thr),
 			"n_neurons_high_quality": int(len(high_neurons)),
 			"frac_neurons_high_quality": (float(len(high_neurons)) / float(len(total_neurons))) if total_neurons else float("nan"),
 			"scope_n_rows": int(len(scope_scores)),
@@ -3364,7 +3437,8 @@ def _hq_scope_records(
 	return {
 		"quality_metric": str(metric_key),
 		"quality_metric_label": str(metric_label),
-		"quality_threshold": float(thr),
+		"quality_threshold": float(thresholds_by_scope.get("test", base_thr)),
+		"quality_thresholds_by_scope": {k: float(v) for k, v in thresholds_by_scope.items()},
 		"min_dataset_coverage": float(min_dataset_coverage),
 		"total_neurons": total_neurons,
 		"all": all_cov,
@@ -3395,7 +3469,8 @@ def _write_high_quality_scope_tex(scope_rec: dict, out_dir: str, stats_dirname: 
 	lines = []
 	lines.append("% Auto-generated by 7_refine_neuron_anchored_rules (high-quality flip coverage, score scopes)")
 	lines.append(f"\\newcommand\\HighQualMetric{tex_suffix}{{{scope_rec.get('quality_metric_label', 'MCC')}}}")
-	lines.append(f"\\newcommand\\HighQualThr{tex_suffix}{{{_fmtf(scope_rec.get('quality_threshold', float('nan')),2)}}}")
+	lines.append(f"\\newcommand\\HighQualThr{tex_suffix}{{{_fmtf((scope_rec.get('quality_thresholds_by_scope') or {}).get('test', scope_rec.get('quality_threshold', float('nan'))),2)}}}")
+	lines.append(f"\\newcommand\\HighQualThrAllFit{tex_suffix}{{{_fmtf((scope_rec.get('quality_thresholds_by_scope') or {}).get('all_fit', float('nan')),2)}}}")
 	lines.append(f"\\newcommand\\HighQualNeurons{tex_suffix}{{{int(test.get('n_neurons_high_quality', 0) or 0)}}}")
 	lines.append(f"\\newcommand\\HighQualNeuronsPct{tex_suffix}{{{_pct(test.get('frac_neurons_high_quality', float('nan')))}}}")
 	lines.append(f"\\newcommand\\HighQualNeuronsAllFit{tex_suffix}{{{int(all_fit.get('n_neurons_high_quality', 0) or 0)}}}")
@@ -3420,6 +3495,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 	stats_dirname: str = "",
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	quality_thresholds_by_scope: dict = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 	baseline_metric_col: str = None,
 ):
@@ -3437,6 +3513,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 		rule_dfs_by_scope={"test": rule_best_df_test, "all_fit": rule_best_df_all_fit},
 		quality_metric=quality_metric,
 		quality_threshold=quality_threshold,
+		quality_thresholds_by_scope=quality_thresholds_by_scope,
 		min_dataset_coverage=min_dataset_coverage,
 		baseline_metric_col=baseline_metric_col,
 	)
@@ -3447,7 +3524,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 	scopes = data["scopes"]
 	baseline_denoms = data.get("baseline_denominators")
 	metric_label = data.get("quality_metric_label", "MCC")
-	thr = float(data.get("quality_threshold", 0.85))
+	thr = float(data.get("quality_threshold", 0.70))
 	total_neurons = data.get("total_neurons", [])
 	# Legacy top-level fields remain TEST semantics. New score_scopes carries both.
 	test = scopes.get("test", {})
@@ -3457,6 +3534,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 		"quality_metric": data.get("quality_metric"),
 		"quality_metric_label": metric_label,
 		"quality_threshold": thr,
+		"quality_thresholds_by_scope": data.get("quality_thresholds_by_scope", {"test": thr}),
 		"min_dataset_coverage": data.get("min_dataset_coverage"),
 		"primary_score_scope": "test",
 		"available_score_scopes": sorted(scopes.keys()),
@@ -3491,6 +3569,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 		def _ratio_payload(num, den):
 			return {"numerator": int(num or 0), "denominator": int(den or 0), "percent": (100.0 * float(num or 0) / float(den or 0)) if float(den or 0) else float("nan")}
 		summary["score_scopes"][scope] = {
+			"quality_threshold": float(rec.get("quality_threshold", thr)),
 			"n_neurons_high_quality": int(rec.get("n_neurons_high_quality", 0) or 0),
 			"frac_neurons_high_quality": float(rec.get("frac_neurons_high_quality", float("nan"))),
 			"scope_n_rows": int(rec.get("scope_n_rows", 0) or 0),
@@ -3569,7 +3648,7 @@ def write_high_quality_neuron_flip_coverage_with_scopes(
 		ax_cov, ax_overlap = axes[1]
 		colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [None, None, None])
 		# Counts.
-		count_labels = ["All\nrule-bearing"] + [_scope_label(s).replace(" ", "\n") + f"\n({metric_label}≥{thr:.2f})" for s in scope_order]
+		count_labels = ["All\nrule-bearing"] + [_scope_label(s).replace(" ", "\n") + f"\n({metric_label}≥{float(scopes[s].get('quality_threshold', thr)):.2f})" for s in scope_order]
 		counts = [len(total_neurons)] + [int(scopes[s].get("n_neurons_high_quality", 0) or 0) for s in scope_order]
 		bars = ax_counts.bar(np.arange(len(counts)), counts, width=0.62, color=colors[:len(counts)])
 		ax_counts.set_xticks(np.arange(len(counts)))
@@ -3694,6 +3773,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 	stats_dirname: str = "",
 	quality_metric: str = "mcc",
 	quality_threshold: float = None,
+	quality_thresholds_by_scope: dict = None,
 	min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
 ):
 	if rule_best_df_test is None or rule_best_df_test.empty:
@@ -3705,6 +3785,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 		rule_dfs_by_scope={"test": rule_best_df_test, "all_fit": rule_best_df_all_fit},
 		quality_metric=quality_metric,
 		quality_threshold=quality_threshold,
+		quality_thresholds_by_scope=quality_thresholds_by_scope,
 		min_dataset_coverage=min_dataset_coverage,
 		baseline_metric_col=None,
 	)
@@ -3713,7 +3794,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 	stats_dir.mkdir(parents=True, exist_ok=True)
 	scopes = data.get("scopes", {})
 	metric_label = data.get("quality_metric_label", "MCC")
-	thr = float(data.get("quality_threshold", 0.85))
+	thr = float(data.get("quality_threshold", 0.70))
 	# High ids by scope.
 	high_ids_by_scope = {scope: set(rec.get("neurons", [])) for scope, rec in scopes.items()}
 	layer_to_neurons = defaultdict(list)
@@ -3785,6 +3866,7 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 		"quality_metric": data.get("quality_metric"),
 		"quality_metric_label": metric_label,
 		"quality_threshold": thr,
+		"quality_thresholds_by_scope": data.get("quality_thresholds_by_scope", {"test": thr}),
 		"min_dataset_coverage": data.get("min_dataset_coverage"),
 		"primary_score_scope": "test",
 		"available_score_scopes": sorted(scopes.keys()),
@@ -3806,8 +3888,11 @@ def write_high_quality_neuron_flip_coverage_by_layer_with_scopes(
 	ax1 = plt.subplot(2, 1, 1)
 	w = 0.25
 	ax1.bar(x - w, df_plot["n_neurons_total"].to_numpy(), w, label="All neurons w/ rules", color=colors[0])
-	ax1.bar(x, df_plot.get("n_neurons_high_quality_test", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ TEST ({metric_label} ≥ {thr:.2f})", color=colors[1])
-	ax1.bar(x + w, df_plot.get("n_neurons_high_quality_all_fit", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ ALL-FIT ({metric_label} ≥ {thr:.2f})", color=colors[2])
+	thr_by_scope = data.get("quality_thresholds_by_scope", {"test": thr, "all_fit": thr})
+	thr_test = float(thr_by_scope.get("test", thr))
+	thr_all_fit = float(thr_by_scope.get("all_fit", thr))
+	ax1.bar(x, df_plot.get("n_neurons_high_quality_test", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ TEST ({metric_label} ≥ {thr_test:.2f})", color=colors[1])
+	ax1.bar(x + w, df_plot.get("n_neurons_high_quality_all_fit", pd.Series([0]*len(df_plot))).to_numpy(), w, label=f"HQ ALL-FIT ({metric_label} ≥ {thr_all_fit:.2f})", color=colors[2])
 	ax1.set_ylabel("# neurons")
 	ax1.set_xticks(x)
 	ax1.set_xticklabels(layer_labels, rotation=45, ha="right")
@@ -3854,6 +3939,9 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 		qual_metric = getattr(args, "threshold_metric", None)
 	qual_metric = _norm_rule_metric_name(qual_metric)
 	qual_thr = getattr(args, "rule_quality_threshold", None)
+	qual_thr = 0.70 if qual_thr is None else float(qual_thr)
+	qual_thr_all_fit = float(getattr(args, "rule_quality_threshold_all_fit", 0.70))
+	qual_thresholds_by_scope = {"test": qual_thr, "all_fit": qual_thr_all_fit}
 	
 	rule_best_df = write_rule_metrics_stats(
 		rules_dir=args.rules_dir,
@@ -3864,6 +3952,7 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 		length_cap=int(getattr(args, "rule_length_cap", 30)),
 		quality_metric=qual_metric,
 		quality_threshold=qual_thr,
+		quality_thresholds_by_scope=qual_thresholds_by_scope,
 		min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 		neurons_sorted=neurons_sorted,
 		scores_df=scores_df,
@@ -3892,6 +3981,7 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 			stats_dirname=stats_dirname,
 			quality_metric=qual_metric,
 			quality_threshold=qual_thr,
+			quality_thresholds_by_scope=qual_thresholds_by_scope,
 			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 			baseline_metric_col=baseline_metric_col,
 		)
@@ -3905,6 +3995,7 @@ def maybe_summarize_rule_metrics_and_high_quality(scores_df: pd.DataFrame, neuro
 			stats_dirname=stats_dirname,
 			quality_metric=qual_metric,
 			quality_threshold=qual_thr,
+			quality_thresholds_by_scope=qual_thresholds_by_scope,
 			min_dataset_coverage=float(getattr(args, "min_rule_dataset_coverage", DEFAULT_MIN_RULE_DATASET_COVERAGE)),
 		)
 
@@ -5212,6 +5303,7 @@ def main():
 						force_recompute=bool(getattr(args, "force_rule_recompute", False)),
 						require_all_fit=bool(getattr(args, "emit_all_fit_rules", True)),
 						targets=targets_this,
+						force_all_fit_recompute=bool(getattr(args, "force_all_fit_recompute", False)),
 					):
 						print(f"[Rules] Skipping (cached, signature match) neuron {layer_label}:{neuron_id} -> {targets_this}")
 						continue

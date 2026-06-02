@@ -59,7 +59,9 @@ summarize_sensitivity_analysis() {
 	python3 "$SUMMARY_SCRIPT" \
 		--stats_root "$STATS_DIR" \
 		--out_dir "$SUMMARY_OUT_DIR" \
-		--baseline_run_name "$BASELINE_RUN_NAME"
+		--baseline_run_name "$BASELINE_RUN_NAME" \
+		--score_scope all_fit \
+		--quality_thresholds 0.50 0.60 0.70 0.75 0.80 0.85
 }
 
 for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
@@ -130,10 +132,20 @@ for ANALYZED_LLM in "${ANALYZED_LLM_LIST[@]}"; do
 				--z_thresh "$Z_THRESH"
 				--batch_size "$BATCH_SIZE"
 				--circuit_level "$CIRCUIT_LEVEL"
-				--circuit_size "$CIRCUIT_SIZE"
 				--min_flip_rate "$MIN_FLIP_RATE"
 				--eval_intervention "$EVAL_INTERVENTION"
 			)
+
+			if [[ "$CIRCUIT_SIZE" == "200000" ]]; then
+				CMD+=(--include_zero_scores)
+				CMD+=(
+					--circuit_size 80000
+				)
+			else
+				CMD+=(
+					--circuit_size "$CIRCUIT_SIZE"
+				)
+			fi
 
 			if ((${#DECODE_ONLY_FLAG[@]} > 0)); then
 				CMD+=("${DECODE_ONLY_FLAG[@]}")

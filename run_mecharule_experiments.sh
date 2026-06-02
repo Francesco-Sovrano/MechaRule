@@ -16,7 +16,7 @@ EXPERIMENT_LIST=(
 )
 
 ANALYZED_LLM_LIST=(
-	# "Qwen/Qwen2-1.5B-Instruct"
+	"Qwen/Qwen2-1.5B-Instruct"
 	"Qwen/Qwen2-7B-Instruct"
 	"EleutherAI/gpt-j-6B"
 	# "EleutherAI/pythia-6.9b"
@@ -87,37 +87,37 @@ for EXPERIMENT in "${EXPERIMENT_LIST[@]}"; do
 
 		echo "Running $EXPERIMENT with Z_THRESH=$Z_THRESH, BATCH_SIZE=$BATCH_SIZE, CIRCUIT_LEVEL=$CIRCUIT_LEVEL, CIRCUIT_SIZE=$CIRCUIT_SIZE, EVAL_INTERVENTION=$EVAL_INTERVENTION"
 
-		# # "Spectral circuit discovery" experiment
-		# bash _run_pipeline.sh \
-		# 	"$EXPERIMENT" \
-		# 	"$ANALYZED_LLM" \
-		# 	--spectral_circuit_discovery \
-		# 	--spectral_anchoring_plan \
-		# 	--fast_anchoring \
-		# 	--z_thresh "$Z_THRESH" \
-		# 	--batch_size "$BATCH_SIZE" \
-		# 	--circuit_level "$CIRCUIT_LEVEL" \
-		# 	--circuit_size "$CIRCUIT_SIZE" \
-		# 	--eval_intervention "$EVAL_INTERVENTION" \
-		# 	"${DECODE_ONLY_FLAG[@]}" \
-		# 	"${NEURONS_TYPE_FLAG[@]}" \
-		# 	--max_number_of_circuits_to_analyze "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
+		# "Spectral circuit discovery" experiment
+		bash _run_pipeline.sh \
+			"$EXPERIMENT" \
+			"$ANALYZED_LLM" \
+			--spectral_circuit_discovery \
+			--spectral_anchoring_plan \
+			--fast_anchoring \
+			--z_thresh "$Z_THRESH" \
+			--batch_size "$BATCH_SIZE" \
+			--circuit_level "$CIRCUIT_LEVEL" \
+			--circuit_size "$CIRCUIT_SIZE" \
+			--eval_intervention "$EVAL_INTERVENTION" \
+			"${DECODE_ONLY_FLAG[@]}" \
+			"${NEURONS_TYPE_FLAG[@]}" \
+			--max_number_of_circuits_to_analyze "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 
-		# # "Random anchoring plan" experiment
-		# bash _run_pipeline.sh \
-		# 	"$EXPERIMENT" \
-		# 	"$ANALYZED_LLM" \
-		# 	--spectral_circuit_discovery \
-		# 	--random_anchoring_plan \
-		# 	--fast_anchoring \
-		# 	--z_thresh "$Z_THRESH" \
-		# 	--batch_size "$BATCH_SIZE" \
-		# 	--circuit_level "$CIRCUIT_LEVEL" \
-		# 	--circuit_size "$CIRCUIT_SIZE" \
-		# 	--eval_intervention "$EVAL_INTERVENTION" \
-		# 	"${DECODE_ONLY_FLAG[@]}" \
-		# 	"${NEURONS_TYPE_FLAG[@]}" \
-		# 	--max_number_of_circuits_to_analyze "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
+		# "Random anchoring plan" experiment
+		bash _run_pipeline.sh \
+			"$EXPERIMENT" \
+			"$ANALYZED_LLM" \
+			--spectral_circuit_discovery \
+			--random_anchoring_plan \
+			--fast_anchoring \
+			--z_thresh "$Z_THRESH" \
+			--batch_size "$BATCH_SIZE" \
+			--circuit_level "$CIRCUIT_LEVEL" \
+			--circuit_size "$CIRCUIT_SIZE" \
+			--eval_intervention "$EVAL_INTERVENTION" \
+			"${DECODE_ONLY_FLAG[@]}" \
+			"${NEURONS_TYPE_FLAG[@]}" \
+			--max_number_of_circuits_to_analyze "$MAX_NUMBER_OF_CIRCUITS_TO_ANALYZE"
 
 		# "Spectral splits" experiment
 		bash _run_pipeline.sh \
@@ -188,7 +188,7 @@ for EXPERIMENT in "${EXPERIMENT_LIST[@]}"; do
 		--stats_path "$EXP_DIR" \
 		--out_dir ./data/aggregated_visualizations \
 		--rule_quality_metric mcc --best_mode tail@0.9 \
-		--thr_min 0.85 --thr_max 0.99 --thr_step 0.01 \
+		--thr_min 0.70 --thr_max 0.99 --thr_step 0.01 \
 		--min_rule_dataset_coverage "$MIN_RULE_DATASET_COVERAGE"
 
 	python3 9_compare_models.py \
@@ -202,7 +202,7 @@ python3 8_compare_experiments.py \
 	--stats_path ./data/ \
 	--out_dir ./data/aggregated_visualizations \
 	--rule_quality_metric mcc --best_mode tail@0.9 \
-	--thr_min 0.85 --thr_max 0.99 --thr_step 0.01 \
+	--thr_min 0.70 --thr_max 0.99 --thr_step 0.01 \
 		--min_rule_dataset_coverage "$MIN_RULE_DATASET_COVERAGE"
 
 python3 10_compute_threshold_sweep_stats.py --csv data/aggregated_visualizations/aggregated_by_task/threshold_sweep_all_tasks_all_llms.csv --min-rule-dataset-coverage "$MIN_RULE_DATASET_COVERAGE"

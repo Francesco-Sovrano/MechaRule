@@ -81,6 +81,23 @@ INTERVENTION_DESCRIPTIONS = {
 }
 
 
+def _normalize_hq_score_scope(scope: str) -> str:
+    sv = str(scope or "all_fit").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if sv in {"eval", "heldout", "held+out", "test"}:
+        return "test"
+    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata"}:
+        return "all_fit"
+    return sv
+
+
+def _hq_score_scope_label(scope: str) -> str:
+    scope = _normalize_hq_score_scope(scope)
+    if scope == "test":
+        return "TEST"
+    if scope == "all_fit":
+        return "ALL-FIT"
+    return scope.upper()
+
 
 def _safe_layer_label(label: object) -> str:
     """Match the layer-key convention used by 7_refine_neuron_anchored_rules.py."""
@@ -395,31 +412,47 @@ def _load_hq_summary(
     fallback_n_identified: int,
     label: str = "run",
     strict_hq_coverage: bool = True,
+    score_scope: str = "test",
 ) -> dict:
-    """Load script-7 high-quality summary without silently turning missing HQ coverage into zeros.
+    """Load script-7 HQ summary for a single explicit score scope.
 
-    `rule_metrics_summary.json` can tell us how many high-quality neurons exist, but it
-    cannot tell us which evaluated rows those HQ neurons flipped.  The row-level union
-    coverage needed for the bottom-right HQ prevalence panel is only in
-    `high_quality_neuron_flip_coverage.json`.  If HQ neurons exist and that coverage
-    file/block is missing, silently plotting 0% is misleading, so strict mode raises.
+    The intervention-shift/resample plots must not silently mix held-out TEST and
+    descriptive ALL-FIT.  New script-7 coverage JSONs expose per-scope blocks in
+    ``score_scopes``.  Older JSONs are interpreted as TEST-only.
     """
+    scope = _normalize_hq_score_scope(score_scope)
     hq_path = stats_dir / "high_quality_neuron_flip_coverage.json"
-    rule_path = stats_dir / "rule_metrics_summary.json"
+    rule_path = stats_dir / (f"rule_metrics_summary_{scope}.json" if scope != "test" else "rule_metrics_summary.json")
+    if scope != "test" and not rule_path.exists():
+        # Scope-specific summary may be unavailable; do not fall back to TEST counts
+        # for ALL-FIT, because that would hide the dichotomy.
+        rule = {}
+    else:
+        rule = _read_json(rule_path)
     hq = _read_json(hq_path)
-    rule = _read_json(rule_path)
     hq_loaded = bool(hq)
 
     quality_metric_label = hq.get("quality_metric_label") or rule.get("quality_metric_label")
     quality_threshold = hq.get("quality_threshold") if hq else rule.get("quality_threshold")
 
-    n_identified = hq.get("n_neurons_total")
+    scope_payload = {}
+    if isinstance(hq, dict) and isinstance(hq.get("score_scopes"), dict):
+        scope_payload = hq.get("score_scopes", {}).get(scope, {}) or {}
+        if scope != "test" and not scope_payload:
+            # Missing ALL-FIT is informationally missing, not TEST.
+            scope_payload = {}
+    elif scope == "test":
+        scope_payload = hq if isinstance(hq, dict) else {}
+
+    n_identified = hq.get("n_neurons_total") if isinstance(hq, dict) else None
     if n_identified is None:
         n_identified = rule.get("n_neurons_with_rules")
     if n_identified is None:
         n_identified = fallback_n_identified
 
-    n_hq = hq.get("n_neurons_high_quality")
+    n_hq = scope_payload.get("n_neurons_high_quality") if isinstance(scope_payload, dict) else None
+    if n_hq is None and scope == "test":
+        n_hq = hq.get("n_neurons_high_quality") if isinstance(hq, dict) else None
     if n_hq is None:
         n_hq = rule.get("n_neurons_quality_ge_threshold")
 
@@ -431,59 +464,68 @@ def _load_hq_summary(
         n_hq_i = int(n_hq) if n_hq is not None else None
     except Exception:
         n_hq_i = None
-
     frac_hq = (float(n_hq_i) / float(n_identified_i)) if (n_hq_i is not None and n_identified_i) else float("nan")
 
+    denoms = {}
+    if isinstance(scope_payload, dict):
+        denoms = scope_payload.get("eligible_denominators") or {}
+    if not denoms and isinstance(hq, dict) and scope == "test":
+        denoms = hq.get("eligible_denominators") or {}
+
+    all_rule_scope = scope_payload.get("all_rule_bearing_in_scope", {}) if isinstance(scope_payload, dict) else {}
+
     missing_reasons: List[str] = []
-    # The HQ-overview prevalence figure only plots these three blocks.
-    # `flip_semantic_wrong` is an optional diagnostic block in script-7 artifacts;
-    # older/current coverage JSONs may contain only union/count fields for it and no
-    # prevalence denominator.  Do not fail the plot just because that optional block
-    # is incomplete.
     required_prevalence_blocks = {"flip_any", "flip_c2i", "flip_i2c"}
 
+    def _scoped_all_values(name: str) -> Tuple[object, object, object]:
+        if name == "flip_any":
+            return all_rule_scope.get("union_any"), all_rule_scope.get("sum_any"), denoms.get("n_eval_baseline_valid") or all_rule_scope.get("n_eval_any")
+        if name == "flip_c2i":
+            return all_rule_scope.get("union_c2i"), all_rule_scope.get("sum_c2i"), denoms.get("n_eval_baseline_correct")
+        if name == "flip_i2c":
+            return all_rule_scope.get("union_i2c"), all_rule_scope.get("sum_i2c"), denoms.get("n_eval_baseline_incorrect")
+        if name == "flip_semantic_wrong":
+            return all_rule_scope.get("union_semantic_wrong"), all_rule_scope.get("sum_semantic_wrong"), None
+        return None, None, None
+
     def flip_block(name: str) -> dict:
-        block = hq.get(name, {}) if isinstance(hq, dict) else {}
-        block_available = isinstance(block, dict) and bool(block)
+        block = scope_payload.get(name, {}) if isinstance(scope_payload, dict) else {}
         if not isinstance(block, dict):
             block = {}
-        union_all = block.get("union_all")
+        legacy_block = hq.get(name, {}) if isinstance(hq, dict) and isinstance(hq.get(name, {}), dict) else {}
+        block_available = bool(block) or (scope == "test" and bool(legacy_block))
+
+        union_all, sum_all, den = _scoped_all_values(name)
         union_high = block.get("union_high")
-        sum_all = block.get("sum_all")
         sum_high = block.get("sum_high")
+        if union_high is None and scope == "test":
+            union_high = legacy_block.get("union_high")
+        if sum_high is None and scope == "test":
+            sum_high = legacy_block.get("sum_high")
+        if union_all is None and scope == "test":
+            union_all = legacy_block.get("union_all")
+        if sum_all is None and scope == "test":
+            sum_all = legacy_block.get("sum_all")
+
         if name == "flip_any":
-            den = block.get("n_rows_with_any_eval_all")
+            if den is None and scope == "test":
+                den = legacy_block.get("n_rows_with_any_eval_all")
             all_pct = _pct_num(union_all, den)
             high_pct = _pct_num(union_high, den)
             den_label = "evaluated rows"
         elif name in {"flip_c2i", "flip_i2c"}:
-            den = block.get("eligible_baseline_count")
-            all_pct = _rate_pct(block.get("eligible_union_rate_all"))
-            high_pct = _rate_pct(block.get("eligible_union_rate_high"))
-            if not math.isfinite(all_pct):
-                all_pct = _pct_num(union_all, den)
-            if not math.isfinite(high_pct):
-                high_pct = _pct_num(union_high, den)
+            if den is None and scope == "test":
+                den = legacy_block.get("eligible_baseline_count")
+            all_pct = _pct_num(union_all, den)
+            high_pct = _pct_num(union_high, den)
             den_label = "eligible rows"
         else:
             den = None
             all_pct = float("nan")
             high_pct = float("nan")
             den_label = "rows"
-        union_share_of_all = block.get("union_share_of_all")
-        if union_share_of_all is None:
-            union_share_of_all = _to_float(union_high) / _to_float(union_all) if _to_float(union_all) else float("nan")
 
-        # The HQ-overview panel is a prevalence-over-eligible-points panel.
-        # Keep the old union-high / union-all diagnostic as a separate field,
-        # but make the displayed/CSV "coverage" value use the same denominator
-        # as the plotted points: eligible/evaluated rows.
-        hq_eligible_points_pct = high_pct
-
-        # A block is complete for plotting when the all/HQ prevalence values are
-        # finite.  For n_hq == 0, a true 0% HQ prevalence is valid if the script-7
-        # coverage file exists; if it does not exist, the value is informationally
-        # missing rather than measured.
+        union_share_of_all = _to_float(union_high) / _to_float(union_all) if _to_float(union_all) else float("nan")
         block_complete = block_available and math.isfinite(all_pct) and math.isfinite(high_pct)
         if n_hq_i and n_hq_i > 0 and name in required_prevalence_blocks and not block_complete:
             missing_reasons.append(name)
@@ -499,15 +541,15 @@ def _load_hq_summary(
             "denominator_label": den_label,
             "all_union_pct": all_pct,
             "high_union_pct": high_pct,
-            "hq_eligible_points_pct": hq_eligible_points_pct,
-            # Backwards-compatible name now uses the prevalence denominator
-            # (eligible/evaluated rows), not union_all.
-            "hq_coverage_share_pct": hq_eligible_points_pct,
+            "hq_eligible_points_pct": high_pct,
+            "hq_coverage_share_pct": high_pct,
             "hq_union_share_of_all_pct": _rate_pct(union_share_of_all),
         }
 
     result = {
         "available": bool(hq) or bool(rule),
+        "score_scope": scope,
+        "score_scope_label": _hq_score_scope_label(scope),
         "coverage_json": str(hq_path) if hq_path.exists() else None,
         "coverage_json_loaded": bool(hq_loaded),
         "rule_metrics_json": str(rule_path) if rule_path.exists() else None,
@@ -519,8 +561,6 @@ def _load_hq_summary(
         "flip_any": flip_block("flip_any"),
         "flip_c2i": flip_block("flip_c2i"),
         "flip_i2c": flip_block("flip_i2c"),
-        # Optional diagnostic block: included in CSV/JSON output when present, but
-        # not required for the HQ prevalence overview.
         "flip_semantic_wrong": flip_block("flip_semantic_wrong"),
     }
 
@@ -528,7 +568,7 @@ def _load_hq_summary(
     result["hq_flip_coverage_missing_blocks"] = sorted(set(missing_reasons))
     if missing_reasons:
         msg = (
-            f"{label}: {n_hq_i} high-quality neurons are reported, but "
+            f"{label} ({_hq_score_scope_label(scope)}): {n_hq_i} high-quality neurons are reported, but "
             f"{hq_path.name} is missing/incomplete for: {', '.join(sorted(set(missing_reasons)))}. "
             "Regenerate script-7 high_quality_neuron_flip_coverage.json before plotting HQ flip prevalence."
         )
@@ -547,6 +587,8 @@ def _hq_rows_for_csv(label: str, hq_summary: Mapping[str, object]) -> List[dict]
         "high_quality_fraction": hq_summary.get("frac_high_quality"),
         "quality_metric_label": hq_summary.get("quality_metric_label"),
         "quality_threshold": hq_summary.get("quality_threshold"),
+        "score_scope": hq_summary.get("score_scope"),
+        "score_scope_label": hq_summary.get("score_scope_label"),
     }]
     for key in ["flip_any", "flip_c2i", "flip_i2c", "flip_semantic_wrong"]:
         block = hq_summary.get(key, {}) if isinstance(hq_summary, dict) else {}
@@ -560,6 +602,8 @@ def _hq_rows_for_csv(label: str, hq_summary: Mapping[str, object]) -> List[dict]
             "high_quality_fraction": hq_summary.get("frac_high_quality"),
             "quality_metric_label": hq_summary.get("quality_metric_label"),
             "quality_threshold": hq_summary.get("quality_threshold"),
+            "score_scope": hq_summary.get("score_scope"),
+            "score_scope_label": hq_summary.get("score_scope_label"),
             "union_all": block.get("union_all"),
             "union_high": block.get("union_high"),
             "sum_all": block.get("sum_all"),
@@ -595,6 +639,7 @@ def _save_hq_overview_plot(
     labels = [lab for lab in labels if lab in records]
     if not labels:
         return None
+    scope_label = str(hq_comparison.get("score_scope_label") or records.get(labels[0], {}).get("score_scope_label") or "TEST")
 
     def arr(path: Sequence[str]) -> np.ndarray:
         vals = []
@@ -629,11 +674,11 @@ def _save_hq_overview_plot(
         identified = arr(["n_identified_neurons"])
         hq = arr(["n_high_quality_neurons"])
         b1 = ax_counts.bar(x - w / 2, identified, w, label="Identified")
-        b2 = ax_counts.bar(x + w / 2, hq, w, label="High-quality")
+        b2 = ax_counts.bar(x + w / 2, hq, w, label=f"HQ ({scope_label})")
         ax_counts.set_xticks(x)
         ax_counts.set_xticklabels(labels)
         ax_counts.set_ylabel("# neurons")
-        ax_counts.set_title("Identified vs high-quality neurons")
+        ax_counts.set_title(f"Identified vs high-quality neurons ({scope_label})")
         ax_counts.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.45)
         ax_counts.legend(frameon=False)
         for bars in [b1, b2]:
@@ -647,7 +692,7 @@ def _save_hq_overview_plot(
         ax_frac.set_xticks(x)
         ax_frac.set_xticklabels(labels)
         ax_frac.set_ylabel("HQ / identified (%)")
-        ax_frac.set_title("High-quality share")
+        ax_frac.set_title(f"High-quality share ({scope_label})")
         ax_frac.set_ylim(0, max(100.0, float(np.nanmax(frac)) * 1.15 if np.isfinite(frac).any() else 100.0))
         ax_frac.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.45)
         for b in bars:
@@ -717,7 +762,7 @@ def _save_hq_overview_plot(
         ax_cov.set_xticks(xd)
         ax_cov.set_xticklabels([s.replace("→", "→\n") for s in direction_labels])
         ax_cov.set_ylabel("Unique flips / eligible points (%)")
-        ax_cov.set_title("Flip prevalence, high-quality neurons")
+        ax_cov.set_title(f"Flip prevalence, HQ neurons ({scope_label})")
         if hq_finite_vals:
             ax_cov.set_ylim(0, max(100.0, max(hq_finite_vals) * 1.16))
         else:
@@ -743,7 +788,7 @@ def _save_hq_overview_plot(
         return out
 
 
-def _load_layer_hq_summary(stats_dir: Path, label: str) -> pd.DataFrame:
+def _load_layer_hq_summary(stats_dir: Path, label: str, score_scope: str = "all_fit") -> pd.DataFrame:
     path = stats_dir / "high_quality_neuron_flip_coverage_by_layer.json"
     payload = _read_json(path)
     rows = payload.get("layers", []) if isinstance(payload, dict) else []
@@ -752,7 +797,24 @@ def _load_layer_hq_summary(stats_dir: Path, label: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+    scope = _normalize_hq_score_scope(score_scope)
+    slug = scope.replace("+", "_").replace("-", "_")
+    # New scoped by-layer JSONs carry suffix-specific HQ fields.  Remap the
+    # requested scope to legacy column names so downstream plots remain simple.
+    if scope != "test":
+        for base in [
+            "n_neurons_high_quality",
+            "n_rows_with_any_eval_high",
+            "flip_any_union_high",
+            "flip_c2i_union_high",
+            "flip_i2c_union_high",
+        ]:
+            scoped = f"{base}_{slug}"
+            if scoped in df.columns:
+                df[base] = df[scoped]
     df["intervention"] = label
+    df["score_scope"] = scope
+    df["score_scope_label"] = _hq_score_scope_label(scope)
     for col in [
         "n_neurons_total", "n_neurons_high_quality", "n_rows_with_any_eval_all",
         "flip_any_union_all", "flip_any_union_high", "flip_c2i_union_all", "flip_c2i_union_high",
@@ -1181,12 +1243,14 @@ def _run_stats_dir_mode(args: argparse.Namespace) -> bool:
         fallback_n_identified=int(len(baseline)),
         label=baseline_label,
         strict_hq_coverage=not bool(args.allow_missing_hq_coverage),
+        score_scope=getattr(args, "hq_score_scope", "all_fit"),
     )
     candidate_hq = _load_hq_summary(
         candidate_dir,
         fallback_n_identified=int(len(candidate)),
         label=candidate_label,
         strict_hq_coverage=not bool(args.allow_missing_hq_coverage),
+        score_scope=getattr(args, "hq_score_scope", "all_fit"),
     )
     hq_rows = _hq_rows_for_csv(baseline_label, baseline_hq) + _hq_rows_for_csv(candidate_label, candidate_hq)
     hq_csv_path = output_dir / "intervention_shift_hq_summary.csv"
@@ -1194,8 +1258,8 @@ def _run_stats_dir_mode(args: argparse.Namespace) -> bool:
         pd.DataFrame(hq_rows).to_csv(hq_csv_path, index=False)
 
     layer_df = pd.concat([
-        _load_layer_hq_summary(baseline_dir, baseline_label),
-        _load_layer_hq_summary(candidate_dir, candidate_label),
+        _load_layer_hq_summary(baseline_dir, baseline_label, getattr(args, "hq_score_scope", "all_fit")),
+        _load_layer_hq_summary(candidate_dir, candidate_label, getattr(args, "hq_score_scope", "all_fit")),
     ], ignore_index=True, sort=False)
     layer_csv_path = output_dir / "intervention_shift_hq_by_layer.csv"
     if not layer_df.empty:
@@ -1213,7 +1277,9 @@ def _run_stats_dir_mode(args: argparse.Namespace) -> bool:
             candidate_label: _intervention_description(candidate_label),
         },
         "high_quality_comparison": {
-            "source": "high_quality_neuron_flip_coverage.json for HQ flip prevalence; rule_metrics_summary.json only for HQ counts fallback",
+            "score_scope": _normalize_hq_score_scope(getattr(args, "hq_score_scope", "all_fit")),
+            "score_scope_label": _hq_score_scope_label(getattr(args, "hq_score_scope", "all_fit")),
+            "source": "high_quality_neuron_flip_coverage.json for HQ flip prevalence; rule_metrics_summary*.json only for HQ counts fallback",
             "runs": {
                 baseline_label: baseline_hq,
                 candidate_label: candidate_hq,
@@ -1413,6 +1479,7 @@ def main() -> None:
     ap.add_argument("--task_name", default=None, help="Task name/module to show in reports/figures")
     ap.add_argument("--model_name", default=None, help="Model name/id to show in reports/figures")
     ap.add_argument("--no_plots", action="store_true", help="Write only CSV/JSON/Markdown, no matplotlib figures")
+    ap.add_argument("--hq_score_scope", default="all_fit", choices=["test", "all_fit"], help="HQ score scope to use in intervention-shift summaries/plots. Default is ALL-FIT for descriptive final-fit; TEST remains available for held-out diagnostics.")
     ap.add_argument(
         "--allow_missing_hq_coverage",
         action="store_true",

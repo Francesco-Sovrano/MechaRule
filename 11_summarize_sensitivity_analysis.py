@@ -40,41 +40,120 @@ def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = 
     cov = pd.to_numeric(out[cov_col], errors="coerce")
     return out[cov >= floor].copy()
 
-def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep only held-out/eval-scored rule-combo rows."""
+def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str = "all_fit") -> pd.DataFrame:
+    """Keep rule-combo rows for exactly one score scope.
+
+    The sensitivity plots must not mix held-out TEST and descriptive ALL-FIT
+    rows.  Filename scope is authoritative for raw cached rule-combo files;
+    legacy rule_combo_train_test_* files are intentionally ignored.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
-    if "flip_target" in out.columns:
-        out = out[~out["flip_target"].astype(str).str.startswith("train_")].copy()
-    if "rule_combo_path" in out.columns:
-        out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
-    return out
+    want = _normalize_score_scope(score_scope)
 
-def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
-    """Load eval-scored rows and keep one best row per localized neuron."""
-    all_path = run_dir / "rule_combo_metrics_all.csv"
-    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
-    if all_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
+    file_s = pd.Series([""] * len(out), index=out.index, dtype="object")
+    for c in ("rule_combo_path", "source_file", "path", "file"):
+        if c in out.columns:
+            file_s = out[c].astype(str)
+            break
+    target_s = out["flip_target"].astype(str) if "flip_target" in out.columns else pd.Series([""] * len(out), index=out.index)
+
+    is_train_test_file = file_s.str.contains("rule_combo_train_test_", regex=False) | target_s.str.startswith("train_test_")
+    # Obsolete merged raw scope should never drive sensitivity counts.
+    if bool(is_train_test_file.any()):
+        out = out.loc[~is_train_test_file].copy()
+        file_s = file_s.loc[out.index]
+        target_s = target_s.loc[out.index]
+
+    is_all_fit_file = file_s.str.contains("rule_combo_all_fit_", regex=False) | target_s.str.startswith("all_fit_")
+    is_train_file = (file_s.str.contains("rule_combo_train_", regex=False) | target_s.str.startswith("train_")) & (~is_all_fit_file)
+    is_rule_combo_file = file_s.str.contains("rule_combo_", regex=False)
+    is_test_file = is_rule_combo_file & (~is_train_file) & (~is_all_fit_file)
+
+    if "score_scope" in out.columns:
+        vals = out["score_scope"].map(_normalize_score_scope)
+    elif "computed_on" in out.columns:
+        vals = out["computed_on"].map(_normalize_score_scope)
+    else:
+        vals = pd.Series(["test"] * len(out), index=out.index)
+
+    # Filename is authoritative for raw rule_combo artifacts.
+    vals = vals.mask(is_all_fit_file, "all_fit").mask(is_train_file, "train").mask(is_test_file, "test")
+
+    if want == "test":
+        return out.loc[vals == "test"].copy()
+    if want == "all_fit":
+        return out.loc[vals == "all_fit"].copy()
+    if want == "train":
+        return out.loc[vals == "train"].copy()
+    return out.loc[vals == want].copy()
+
+
+def _scope_specific_metric_paths(run_dir: Path, score_scope: str) -> Tuple[Path, Path]:
+    slug = _score_scope_slug(score_scope)
+    return (
+        run_dir / f"rule_combo_metrics_{slug}_all.csv",
+        run_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv",
+    )
+
+
+def _load_best_rule_rows(
+    run_dir: Path,
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scope: str = "all_fit",
+) -> pd.DataFrame:
+    """Load one best rule row per localized neuron for one score scope."""
+    scope = _normalize_score_scope(score_scope)
+    scoped_all, scoped_best = _scope_specific_metric_paths(run_dir, scope)
+    candidates: List[Tuple[Path, bool]] = []
+    if scoped_all.exists():
+        candidates.append((scoped_all, False))
+    if scoped_best.exists():
+        candidates.append((scoped_best, True))
+    # Legacy files are TEST-only.
+    if scope == "test":
+        candidates.extend([
+            (run_dir / "rule_combo_metrics_all.csv", False),
+            (run_dir / "rule_combo_metrics_best_per_neuron.csv", True),
+        ])
+
+    for path, already_best in candidates:
+        if not path.exists():
+            continue
+        df = safe_read_csv(path) if 'safe_read_csv' in globals() else pd.read_csv(path, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
         df = _apply_min_dataset_coverage(df, min_dataset_coverage)
-        if df.empty:
-            return df
+        if df is None or df.empty:
+            continue
+        if already_best:
+            return df.copy()
         sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
         for c in sort_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         if sort_cols:
-            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
         key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
         if not key_cols:
             key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
         if key_cols:
             df = df.drop_duplicates(key_cols, keep="first")
-        return df
-    if best_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
-        return _apply_min_dataset_coverage(df, min_dataset_coverage)
+        return df.reset_index(drop=True)
+
+    # Last-resort legacy top-k fallback is TEST-only; do not use for ALL-FIT.
+    if scope == "test":
+        path = run_dir / "rule_combo_metrics_top_50.csv"
+        if path.exists():
+            df = _filter_rule_rows_by_score_scope(safe_read_csv(path), "test")
+            df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+            if df is not None and not df.empty:
+                return df
     return pd.DataFrame()
+
+
+# Backwards-compatible alias used by old snippets/tests.
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+    return _load_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage, score_scope="test")
 
 
 import matplotlib
@@ -84,11 +163,62 @@ import matplotlib.pyplot as plt
 RUN_RE_M = re.compile(r'(?:^|[-_/])M(?P<M>\d+)(?:$|[-_/])', re.IGNORECASE)
 RUN_RE_TAU = re.compile(r'(?:^|[-_/])tau(?P<tau>\d+(?:\.\d+)?)(?:$|[-_/])', re.IGNORECASE)
 
-DEFAULT_BASELINE_M = 43008
+DEFAULT_BASELINE_M = 43008 #100000
 DEFAULT_BASELINE_TAU = 0.2
 DEFAULT_BASELINE_RUN_NAME = 'rule_split-spectral_sample-decode_only-agonist_neurons-fast-spectral_anchor'
-DEFAULT_QUALITY_THRESHOLDS = [0.50, 0.60, 0.70, 0.75, 0.80]
+DEFAULT_QUALITY_THRESHOLDS = [0.50, 0.60, 0.70, 0.75, 0.80, 0.85]
 
+
+def _normalize_score_scope(scope: str) -> str:
+    """Normalize rule-quality score scope names.
+
+    TEST is the held-out/generalization scope.  ALL-FIT is a descriptive
+    final-fit scope selected and scored on all available rows.  Older
+    train+test aliases are normalized to all_fit only for command-line
+    compatibility; raw rule_combo_train_test_* files are ignored.
+    """
+    sv = str(scope or "all_fit").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if sv in {"eval", "heldout", "held+out", "test"}:
+        return "test"
+    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata", "train+test", "traintest"}:
+        return "all_fit"
+    if sv.startswith("train"):
+        return "train"
+    if sv == "both":
+        return "both"
+    return sv
+
+
+def _score_scope_slug(scope: str) -> str:
+    return _normalize_score_scope(scope).replace("+", "_").replace("-", "_")
+
+
+def _score_scope_label(scope: str) -> str:
+    scope = _normalize_score_scope(scope)
+    if scope == "test":
+        return "TEST"
+    if scope == "all_fit":
+        return "ALL-FIT"
+    return str(scope).upper()
+
+
+def _score_scopes_from_arg(value: str) -> List[str]:
+    parts = [p.strip() for p in str(value or "all_fit").split(",") if p.strip()]
+    if not parts:
+        parts = ["all_fit"]
+    out: List[str] = []
+    for part in parts:
+        norm = _normalize_score_scope(part)
+        if norm == "both":
+            out.extend(["test", "all_fit"])
+        elif norm not in out:
+            out.append(norm)
+    # stable dedupe
+    dedup: List[str] = []
+    for scope in out:
+        if scope not in dedup:
+            dedup.append(scope)
+    return dedup or ["all_fit"]
 
 
 def safe_load_json(path: Path) -> dict:
@@ -175,21 +305,19 @@ def infer_quality_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def threshold_counts_from_csv(run_dir: Path, thresholds: List[float], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> Dict[str, float]:
-    df = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage)
-    if df.empty:
-        candidates = [
-            run_dir / 'rule_combo_metrics_top_50.csv',
-        ]
-        for path in candidates:
-            if path.exists():
-                df = _apply_min_dataset_coverage(_drop_train_scored_rule_rows(safe_read_csv(path)), min_dataset_coverage)
-                if not df.empty:
-                    break
+def threshold_counts_from_csv(
+    run_dir: Path,
+    thresholds: List[float],
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scope: str = "all_fit",
+) -> Dict[str, float]:
+    df = _load_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope)
 
     out: Dict[str, float] = {}
     if df.empty:
+        out['scope_available'] = 0.0
         return out
+    out['scope_available'] = 1.0
 
     qcol = infer_quality_column(df)
     if qcol is None:
@@ -579,11 +707,16 @@ def extract_metrics(
     thresholds: List[float],
     localization_index: Optional[Dict[str, List[Path]]] = None,
     min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scope: str = "all_fit",
 ) -> Dict[str, float]:
-    rule = safe_load_json(run_dir / 'rule_metrics_summary.json')
+    scope = _normalize_score_scope(score_scope)
+    summary_path = run_dir / f'rule_metrics_summary_{_score_scope_slug(scope)}.json'
+    if scope == 'test' and not summary_path.exists():
+        summary_path = run_dir / 'rule_metrics_summary.json'
+    rule = safe_load_json(summary_path)
     flip = safe_load_json(run_dir / 'flip_stats_global.json')
 
-    out: Dict[str, float] = {}
+    out: Dict[str, float] = {"score_scope_available": 1.0 if rule else 0.0}
 
     def put(name: str, value) -> None:
         try:
@@ -600,26 +733,35 @@ def extract_metrics(
     put('dataset_coverage_median', ((rule.get('dataset_coverage') or {}).get('median')))
     put('union_flip_any_unique_rate', flip.get('union_flip_any_unique_rate'))
 
-    out.update(threshold_counts_from_csv(run_dir, thresholds, min_dataset_coverage=min_dataset_coverage))
+    out.update(threshold_counts_from_csv(run_dir, thresholds, min_dataset_coverage=min_dataset_coverage, score_scope=scope))
     if localization_index:
         out.update(cha_budget_metrics(run_dir.name, localization_index))
     return out
 
 
-def build_summary_df(stats_root: Path, baseline_run_name: str, baseline_m: int, baseline_tau: float, thresholds: List[float], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+def build_summary_df(
+    stats_root: Path,
+    baseline_run_name: str,
+    baseline_m: int,
+    baseline_tau: float,
+    thresholds: List[float],
+    min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE,
+    score_scope: str = "all_fit",
+) -> pd.DataFrame:
+    scope = _normalize_score_scope(score_scope)
     rows = []
     localization_index = build_localization_index(stats_root)
     for run_dir in discover_run_dirs(stats_root):
         M, tau = parse_run_params(run_dir, baseline_run_name, baseline_m, baseline_tau)
-        row = {'run_name': run_dir.name, 'run_dir': str(run_dir), 'M': M, 'tau': tau}
-        row.update(extract_metrics(run_dir, thresholds, localization_index, min_dataset_coverage=min_dataset_coverage))
+        row = {'run_name': run_dir.name, 'run_dir': str(run_dir), 'M': M, 'tau': tau, 'score_scope': scope, 'score_scope_label': _score_scope_label(scope)}
+        row.update(extract_metrics(run_dir, thresholds, localization_index, min_dataset_coverage=min_dataset_coverage, score_scope=scope))
         rows.append(row)
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df['M'] = pd.to_numeric(df['M'], errors='coerce').astype('Int64')
     df['tau'] = pd.to_numeric(df['tau'], errors='coerce')
-    return df.sort_values(['M', 'tau', 'run_name'], kind='stable').reset_index(drop=True)
+    return df.sort_values(['score_scope', 'M', 'tau', 'run_name'], kind='stable').reset_index(drop=True)
 
 
 def choose_baseline(df: pd.DataFrame, baseline_run_name: str, baseline_m: int, baseline_tau: float) -> Optional[pd.Series]:
@@ -882,39 +1024,32 @@ def save_threshold_sweep_plots(df: pd.DataFrame, baseline_row: pd.Series, thresh
     return summary_df
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--stats_root', required=True)
-    ap.add_argument('--out_dir', required=True)
-    ap.add_argument('--baseline_M', type=int, default=DEFAULT_BASELINE_M)
-    ap.add_argument('--baseline_tau', type=float, default=DEFAULT_BASELINE_TAU)
-    ap.add_argument('--baseline_run_name', default=DEFAULT_BASELINE_RUN_NAME)
-    ap.add_argument('--quality_thresholds', nargs='*', type=float, default=DEFAULT_QUALITY_THRESHOLDS)
-    ap.add_argument('--min_rule_dataset_coverage', type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
-                    help='Minimum held-out dataset_coverage required before a rule contributes to threshold-sensitivity counts. Use 0 to disable.')
-    ap.add_argument('--paper_fig_dir', default=None, help='Optional paper figure directory. If set, cha_budget_vs_tau.pdf is copied there.')
-    args = ap.parse_args()
-
-    thresholds = sorted(set(float(x) for x in args.quality_thresholds))
-    stats_root = Path(args.stats_root)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    df = build_summary_df(stats_root, args.baseline_run_name, args.baseline_M, args.baseline_tau, thresholds, min_dataset_coverage=args.min_rule_dataset_coverage)
+def _run_one_scope(args, stats_root: Path, out_dir: Path, thresholds: List[float], score_scope: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    scope = _normalize_score_scope(score_scope)
+    df = build_summary_df(
+        stats_root,
+        args.baseline_run_name,
+        args.baseline_M,
+        args.baseline_tau,
+        thresholds,
+        min_dataset_coverage=args.min_rule_dataset_coverage,
+        score_scope=scope,
+    )
     if df.empty:
-        raise SystemExit(f'No sensitivity-analysis runs found under: {stats_root}')
-
+        raise SystemExit(f'No sensitivity-analysis runs found under: {stats_root} for score scope {scope}')
     df.to_csv(out_dir / 'sensitivity_summary.csv', index=False)
 
-    baseline_row = choose_baseline(df, args.baseline_run_name, args.baseline_M, args.baseline_tau)
+    baseline_df = df[df.get('score_scope', scope) == scope]
+    baseline_row = choose_baseline(baseline_df, args.baseline_run_name, args.baseline_M, args.baseline_tau)
     if baseline_row is None:
-        raise SystemExit('Could not determine a baseline run.\nParsed rows:\n' + df[['run_name', 'M', 'tau']].to_string(index=False))
+        raise SystemExit('Could not determine a baseline run for score scope ' + scope + '.\nParsed rows:\n' + baseline_df[['run_name', 'M', 'tau', 'score_scope']].to_string(index=False))
 
     plot_dir = out_dir / 'plots'
-    compact_df = save_threshold_sweep_plots(df, baseline_row, thresholds, plot_dir)
+    compact_df = save_threshold_sweep_plots(baseline_df, baseline_row, thresholds, plot_dir)
+    compact_df.insert(0, 'score_scope', scope)
 
     if args.paper_fig_dir:
-        paper_fig_dir = Path(args.paper_fig_dir)
+        paper_fig_dir = Path(args.paper_fig_dir) / _score_scope_slug(scope)
         paper_fig_dir.mkdir(parents=True, exist_ok=True)
         for fname in ['cha_budget_vs_tau.pdf']:
             src = plot_dir / fname
@@ -924,6 +1059,8 @@ def main() -> None:
     lines = [
         '# Sensitivity across quality thresholds',
         '',
+        f'- score scope: `{_score_scope_label(scope)}`',
+        '- TEST is held-out/generalization; ALL-FIT is descriptive final-fit selected and scored on all rows.',
         f'- baseline run: `{baseline_row["run_name"]}`',
         f'- baseline M: {int(baseline_row["M"])}',
         f'- baseline tau: {float(baseline_row["tau"])}',
@@ -934,8 +1071,7 @@ def main() -> None:
         '- `plots/quality_threshold_sensitivity_vs_M.pdf`',
         '- `plots/quality_threshold_sensitivity_heatmap_tau.pdf`',
         '- `plots/quality_threshold_sensitivity_heatmap_M.pdf`',
-        '- `plots/cha_budget_vs_tau.pdf` (mean CHA group-evaluation count with +/-1 SE error bars; labels also show % of per-circuit sum_l(2N_l-1) from circuit-detail JSON)',
-        '- `plots/cha_budget_vs_tau.csv` (absolute budget metrics and % of per-circuit layerwise tree-budget values)',
+        '- `plots/cha_budget_vs_tau.pdf`',
         '- `plots/quality_threshold_sensitivity_compact.csv`',
     ]
     if not compact_df.empty:
@@ -943,9 +1079,58 @@ def main() -> None:
         lines.append('Compact summary rows are saved in `plots/quality_threshold_sensitivity_compact.csv`.')
     (out_dir / 'README_quality_threshold_sensitivity.md').write_text('\n'.join(lines), encoding='utf-8')
 
+    print(f'Score scope: {scope} ({_score_scope_label(scope)})')
     print(f'Baseline run: {baseline_row["run_name"]}')
     print('CHA budget percentages use per-circuit detail JSON denominators: sum_l(2N_l-1).')
     print(f'Wrote threshold sensitivity plots under: {plot_dir}')
+    return df, compact_df
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--stats_root', required=True)
+    ap.add_argument('--out_dir', required=True)
+    ap.add_argument('--baseline_M', type=int, default=DEFAULT_BASELINE_M)
+    ap.add_argument('--baseline_tau', type=float, default=DEFAULT_BASELINE_TAU)
+    ap.add_argument('--baseline_run_name', default=DEFAULT_BASELINE_RUN_NAME)
+    ap.add_argument('--quality_thresholds', nargs='*', type=float, default=DEFAULT_QUALITY_THRESHOLDS)
+    ap.add_argument('--min_rule_dataset_coverage', type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
+                    help='Minimum dataset_coverage required before a rule contributes to threshold-sensitivity counts. Use 0 to disable.')
+    ap.add_argument('--score_scope', default='all_fit', help='Score scope(s) for rule-quality/HQ counts: all_fit (default), test, or both. Comma-separated values are allowed.')
+    ap.add_argument('--paper_fig_dir', default=None, help='Optional paper figure directory. If set, cha_budget_vs_tau.pdf is copied under scope-specific subdirs when multiple scopes are requested.')
+    args = ap.parse_args()
+
+    thresholds = sorted(set(float(x) for x in args.quality_thresholds))
+    stats_root = Path(args.stats_root)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scopes = _score_scopes_from_arg(args.score_scope)
+
+    all_summaries = []
+    all_compact = []
+    for scope in scopes:
+        scope_out = out_dir / _score_scope_slug(scope) if len(scopes) > 1 else out_dir
+        scope_out.mkdir(parents=True, exist_ok=True)
+        df, compact = _run_one_scope(args, stats_root, scope_out, thresholds, scope)
+        all_summaries.append(df)
+        all_compact.append(compact)
+
+    if len(scopes) > 1:
+        combined = pd.concat(all_summaries, ignore_index=True, sort=False) if all_summaries else pd.DataFrame()
+        combined.to_csv(out_dir / 'sensitivity_summary_all_scopes.csv', index=False)
+        compact_all = pd.concat(all_compact, ignore_index=True, sort=False) if all_compact else pd.DataFrame()
+        compact_all.to_csv(out_dir / 'quality_threshold_sensitivity_compact_all_scopes.csv', index=False)
+        (out_dir / 'README_quality_threshold_sensitivity.md').write_text(
+            '# Sensitivity across quality thresholds\n\n'
+            'This directory contains scope-specific sensitivity outputs. The default sensitivity view is `all_fit/` for descriptive final-fit statistics; use `test/` only when explicitly requested for held-out/generalization diagnostics.\n\n'
+            '- `sensitivity_summary_all_scopes.csv` combines both scopes.\n'
+            '- `quality_threshold_sensitivity_compact_all_scopes.csv` combines compact change summaries.\n',
+            encoding='utf-8',
+        )
+        print('Wrote score-scope-specific sensitivity outputs to:')
+        for scope in scopes:
+            print(f'  - {out_dir / _score_scope_slug(scope)}')
+
 
 
 if __name__ == '__main__':

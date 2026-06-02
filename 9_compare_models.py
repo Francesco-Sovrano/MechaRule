@@ -321,7 +321,7 @@ def summarize_run(model_root: Path, run_name: str, tau: float, eps: float, displ
             out['n_neurons_with_rules'] = int(vals.size)
             out['rule_mcc_median'] = float(np.median(vals))
             out['rule_mcc_mean'] = float(np.mean(vals))
-            thr = out['hq_threshold'] if np.isfinite(out['hq_threshold']) else 0.85
+            thr = out['hq_threshold'] if np.isfinite(out['hq_threshold']) else 0.70
             out['frac_neurons_hq'] = float(np.mean(vals >= float(thr)))
             out['min_rule_dataset_coverage'] = float(min_dataset_coverage)
 

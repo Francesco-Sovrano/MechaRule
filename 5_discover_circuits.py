@@ -102,6 +102,15 @@ def parse_args():
 	p.add_argument("--intervention", type=str, default="zero")
 	p.add_argument("--eval_intervention", type=str, default="mean-positional")
 	p.add_argument("--absolute_value_attributions", action="store_true")
+	p.add_argument(
+		"--include_zero_scores",
+		action="store_true",
+		help=(
+			"Allow finite exact-zero attribution scores to be eligible for top-N selection. "
+			"Default preserves historical behavior, which excludes zeros. Useful for "
+			"including zero-score neurons when --circuit_level neuron."
+		),
+	)
 	p.add_argument("--mlp_neurons_only", action="store_true")
 
 	# Model
@@ -686,6 +695,7 @@ def _run_circuit_discovery_from_pairs(
 		level=level,
 		reset=True,
 		prune=False,
+		include_zero_scores=args.include_zero_scores,
 	)
 
 	scores_tensor = (
@@ -703,6 +713,7 @@ def _run_circuit_discovery_from_pairs(
 		include_special=False,
 		return_scores=True,
 		return_metadata=True,
+		include_zero_scores=args.include_zero_scores,
 	)
 
 	if debug_label:
