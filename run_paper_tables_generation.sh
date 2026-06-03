@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Activate virtual environment
+source .env/bin/activate
+
 DATA_ROOT="./data"
 OUT_DIR="./paper_tables"
 TEST_THRESHOLD="0.70"
