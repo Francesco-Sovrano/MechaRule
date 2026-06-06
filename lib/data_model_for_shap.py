@@ -29,17 +29,30 @@ import torch
 # not on EVAL/TEST alone. Cached ALL-FIT rows without this token are stale.
 ALL_FIT_CACHE_SIGNATURE = "all_fit_selected_scored_on_train_plus_eval_v2"
 
-def _all_fit_combo_cache_current(path: str) -> bool:
-	"""Return True only for ALL-FIT combo artifacts with the current semantics token."""
+# New, separate HQ-T-style artifact. We keep rule_combo_<target>.csv as the
+# original frozen-train-combo TEST score and write this selected-on-TEST variant
+# under rule_combo_test_selected_<target>.csv so old caches/results are not
+# overwritten.
+TEST_SELECTED_COMBO_CACHE_SIGNATURE = "test_selected_from_train_rules_v1"
+
+def _combo_cache_has_signature(path: str, column: str, expected: str) -> bool:
 	if not os.path.exists(path) or os.path.getsize(path) <= 0:
 		return False
 	try:
 		df = pd.read_csv(path, nrows=1)
 	except Exception:
 		return False
-	if df.empty or "all_fit_cache_signature" not in df.columns:
+	if df.empty or column not in df.columns:
 		return False
-	return str(df.loc[0, "all_fit_cache_signature"]) == ALL_FIT_CACHE_SIGNATURE
+	return str(df.loc[0, column]) == expected
+
+def _test_selected_combo_cache_current(path: str) -> bool:
+	"""Return True only for TEST-selected combo artifacts with the current semantics token."""
+	return _combo_cache_has_signature(path, "test_selected_combo_cache_signature", TEST_SELECTED_COMBO_CACHE_SIGNATURE)
+
+def _all_fit_combo_cache_current(path: str) -> bool:
+	"""Return True only for ALL-FIT combo artifacts with the current semantics token."""
+	return _combo_cache_has_signature(path, "all_fit_cache_signature", ALL_FIT_CACHE_SIGNATURE)
 
 @njit(inline='always', fastmath=True, nogil=True)
 def _intersect_two_sorted(a, b, out):
@@ -790,11 +803,13 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 		"""
 		train_path = os.path.join(out_dir, f"rule_combo_train_{metric_name}.csv")
 		test_path = os.path.join(out_dir, f"rule_combo_{metric_name}.csv")
+		test_selected_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric_name}.csv")
 		all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric_name}.csv")
 		need_all_fit = bool(getattr(args, "emit_all_fit_rules", True))
 		return (
 			os.path.exists(train_path)
 			and (df_eval is None or os.path.exists(test_path))
+			and (df_eval is None or _test_selected_combo_cache_current(test_selected_path))
 			and ((not need_all_fit) or _all_fit_combo_cache_current(all_fit_path))
 		)
 
@@ -816,11 +831,13 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 				print(f"WARNING: could not remove stale raw TRAIN+TEST combo artifact {stale_train_test_combo}: {exc}")
 		train_combo_path = os.path.join(out_dir, f"rule_combo_train_{metric}.csv")
 		test_combo_path = os.path.join(out_dir, f"rule_combo_{metric}.csv")
+		test_selected_combo_path = os.path.join(out_dir, f"rule_combo_test_selected_{metric}.csv")
 		all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric}.csv")
 		need_all_fit = bool(getattr(args, "emit_all_fit_rules", True))
 		train_test_cache_complete = (
 			os.path.exists(train_combo_path)
 			and (df_eval is None or os.path.exists(test_combo_path))
+			and (df_eval is None or _test_selected_combo_cache_current(test_selected_combo_path))
 		)
 		all_fit_cache_current = (not need_all_fit) or _all_fit_combo_cache_current(all_fit_path)
 		only_recompute_all_fit = bool(
@@ -1147,6 +1164,40 @@ def run_rule_extraction(df: pd.DataFrame, input_features, targets, args, rfmode=
 			print('Best rule combo (train-selected):', json.dumps(best_combo_train, indent=4))
 			if df_eval is not None:
 				print('Held-out TEST score for frozen combo:', json.dumps(best_combo, indent=4))
+
+				# Separate HQ-T-style artifact: candidate rules are emitted from TRAIN,
+				# but the OR-subset is selected and scored on held-out TEST rows.
+				# Keep this out of rule_combo_<target>.csv so legacy frozen-combo TEST
+				# results remain available and cached.
+				best_combo_test_selected_raw = rf_model.find_best_or_combo(
+					rules,
+					X=eval_X,
+					y_target=eval_y,
+					greedy_seed_metrics=greedy_seed_metrics,
+					greedy_seed_topk=greedy_seed_topk,
+				)
+				best_combo_test_selected = _score_frozen_combo(
+					best_combo_test_selected_raw,
+					eval_X,
+					eval_y,
+					computed_on="test_selected",
+					chosen_from="test_selected_from_train_emitted_rules",
+				)
+				best_combo_test_selected["selection_scope"] = "test_selected"
+				best_combo_test_selected["heldout_valid"] = False
+				best_combo_test_selected["test_selected_combo_cache_signature"] = TEST_SELECTED_COMBO_CACHE_SIGNATURE
+				best_combo_test_selected["test_selected_source_rules"] = "train_emitted_rules"
+				best_combo_test_selected["test_selected_n_eval_rows"] = int(eval_X_and_y.shape[0])
+				pd.DataFrame([best_combo_test_selected]).to_csv(test_selected_combo_path, index=False)
+				print('Held-out TEST-selected score over train-emitted rules:', json.dumps(best_combo_test_selected, indent=4))
+				if "selected_rule_indices" in best_combo_test_selected_raw:
+					selected_literals_test = set(map(str, best_combo_test_selected_raw.get("selected_literals", []) or []))
+					if selected_literals_test:
+						selected_rules_test = rules[rules["rule_expression"].astype(str).isin(selected_literals_test)]
+					else:
+						selected_rule_indices_test = best_combo_test_selected_raw["selected_rule_indices"]
+						selected_rules_test = rules[rules["rule_index"].isin(selected_rule_indices_test)]
+					selected_rules_test.to_csv(os.path.join(out_dir, f"optimal_rule_set_test_selected_{metric}.csv"), index=False)
 		if bool(getattr(args, "emit_all_fit_rules", True)):
 			all_fit_path = os.path.join(out_dir, f"rule_combo_all_fit_{metric}.csv")
 			if force_rule_recompute or force_all_fit_recompute or (not _all_fit_combo_cache_current(all_fit_path)):

@@ -24,12 +24,12 @@ Options:
   --primary-threshold VALUE   Deprecated alias for --test-threshold
   --sample-stat VALUE         Threshold-free sampled statistic: mean, median, prop_ge_threshold, or n_ge_threshold (default: mean)
   --n-boot N                  Bootstrap iterations for sampled stats (default: 10000)
-  --stats-score-scope SCOPE   Scope for statistical comparison: test, all_fit, or both (default: both; test + all_fit)
+  --stats-score-scope SCOPE   Scope for statistical comparison: test_selected, all_fit, test, or both (default: both; HQ-T + HQ-F)
   --min-rule-dataset-coverage VALUE  Minimum dataset coverage for HQ counts (default: 0.005)
   -h, --help                  Show help
 
 This script generates paper tables and statistically valid E1/E3 comparison files.
-By default it writes both TEST and ALL-FIT score-scope outputs. Threshold sweeps are descriptive only; inference uses one paired value per task/model unit.
+By default it writes HQ-T/test_selected and HQ-F/all_fit score-scope outputs. Threshold sweeps are descriptive only; inference uses one paired value per task/model unit.
 EOH
 }
 
@@ -87,7 +87,7 @@ if [ -f .env/bin/activate ]; then
   source .env/bin/activate
 fi
 
-python3 make_paper_tables.py --data_root "$DATA_ROOT" --out_dir "$OUT_DIR" --min_rule_dataset_coverage "$MIN_RULE_DATASET_COVERAGE" --hq_test_threshold "$TEST_THRESHOLD" --hq_all_fit_threshold "$ALL_FIT_THRESHOLD" --table1_coverage_score_scope all_fit
+python3 make_paper_tables.py --data_root "$DATA_ROOT" --out_dir "$OUT_DIR" --min_rule_dataset_coverage "$MIN_RULE_DATASET_COVERAGE" --hq_test_threshold "$TEST_THRESHOLD" --hq_all_fit_threshold "$ALL_FIT_THRESHOLD" --score_scopes test_selected,all_fit --table1_coverage_score_scope all_fit
 
 python3 10_compute_threshold_sweep_stats.py \
   --csv "$OUT_DIR/table2_threshold_sweep_per_run_long.csv" \

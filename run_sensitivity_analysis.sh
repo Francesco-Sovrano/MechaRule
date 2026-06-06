@@ -60,7 +60,7 @@ summarize_sensitivity_analysis() {
 		--stats_root "$STATS_DIR" \
 		--out_dir "$SUMMARY_OUT_DIR" \
 		--baseline_run_name "$BASELINE_RUN_NAME" \
-		--score_scope all_fit \
+		--score_scope "${SENSITIVITY_SCORE_SCOPE:-all_fit}" \
 		--quality_thresholds 0.50 0.60 0.70 0.75 0.80 0.85
 }
 

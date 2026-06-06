@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -12,6 +13,40 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+RULE_METRICS_SUMMARY_CACHE_SIGNATURE = "rule_combo_metrics_from_raw_v1"
+
+
+def _rule_metrics_manifest_current(stats_dir: Path) -> bool:
+    """Return True when scoped metric summaries carry the current schema marker.
+
+    The manifest is a semantic/schema certificate for derived
+    rule_combo_metrics_* summaries, not a hard cache key for the whole raw
+    rules_dir.  We intentionally do not reject summaries when the optional raw
+    digest differs: local rules_dir trees can contain extra raw rule_combo files
+    from other runs or later experiments that do not affect this stats folder.
+    Stage 7 still writes the raw digest for audit/debugging, and rerunning
+    Stage 7 with --summarize_rule_metrics overwrites the metric summaries.
+    """
+    manifest_path = Path(stats_dir) / "rule_combo_metrics_manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return manifest.get("signature") == RULE_METRICS_SUMMARY_CACHE_SIGNATURE
+
+
+def _scoped_rule_metrics_are_safe(run_dir: Path, scope: str) -> bool:
+    scope = _normalize_score_scope(scope)
+    if scope not in ("test_selected", "all_fit"):
+        return True
+    ok = _rule_metrics_manifest_current(run_dir)
+    if not ok:
+        print(f"[rule-metrics] warning: stale or missing rule_combo_metrics_manifest.json in {run_dir}; rerun Stage 7 with --summarize_rule_metrics. Ignoring {scope} summaries.")
+    return ok
+
 
 
 def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
@@ -67,9 +102,10 @@ def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str = "all_f
         target_s = target_s.loc[out.index]
 
     is_all_fit_file = file_s.str.contains("rule_combo_all_fit_", regex=False) | target_s.str.startswith("all_fit_")
-    is_train_file = (file_s.str.contains("rule_combo_train_", regex=False) | target_s.str.startswith("train_")) & (~is_all_fit_file)
+    is_test_selected_file = file_s.str.contains("rule_combo_test_selected_", regex=False) | target_s.str.startswith("test_selected_")
+    is_train_file = (file_s.str.contains("rule_combo_train_", regex=False) | target_s.str.startswith("train_")) & (~is_all_fit_file) & (~is_test_selected_file)
     is_rule_combo_file = file_s.str.contains("rule_combo_", regex=False)
-    is_test_file = is_rule_combo_file & (~is_train_file) & (~is_all_fit_file)
+    is_test_file = is_rule_combo_file & (~is_train_file) & (~is_all_fit_file) & (~is_test_selected_file)
 
     if "score_scope" in out.columns:
         vals = out["score_scope"].map(_normalize_score_scope)
@@ -79,10 +115,12 @@ def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str = "all_f
         vals = pd.Series(["test"] * len(out), index=out.index)
 
     # Filename is authoritative for raw rule_combo artifacts.
-    vals = vals.mask(is_all_fit_file, "all_fit").mask(is_train_file, "train").mask(is_test_file, "test")
+    vals = vals.mask(is_all_fit_file, "all_fit").mask(is_test_selected_file, "test_selected").mask(is_train_file, "train").mask(is_test_file, "test")
 
     if want == "test":
         return out.loc[vals == "test"].copy()
+    if want == "test_selected":
+        return out.loc[vals == "test_selected"].copy()
     if want == "all_fit":
         return out.loc[vals == "all_fit"].copy()
     if want == "train":
@@ -105,6 +143,8 @@ def _load_best_rule_rows(
 ) -> pd.DataFrame:
     """Load one best rule row per localized neuron for one score scope."""
     scope = _normalize_score_scope(score_scope)
+    if not _scoped_rule_metrics_are_safe(run_dir, scope):
+        return pd.DataFrame()
     scoped_all, scoped_best = _scope_specific_metric_paths(run_dir, scope)
     candidates: List[Tuple[Path, bool]] = []
     if scoped_all.exists():
@@ -178,9 +218,11 @@ def _normalize_score_scope(scope: str) -> str:
     compatibility; raw rule_combo_train_test_* files are ignored.
     """
     sv = str(scope or "all_fit").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if sv in {"test+selected", "heldout+selected", "held+out+selected", "hqt", "hq+t"}:
+        return "test_selected"
     if sv in {"eval", "heldout", "held+out", "test"}:
         return "test"
-    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata", "train+test", "traintest"}:
+    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata", "train+test", "traintest", "hqf", "hq+f"}:
         return "all_fit"
     if sv.startswith("train"):
         return "train"
@@ -195,10 +237,12 @@ def _score_scope_slug(scope: str) -> str:
 
 def _score_scope_label(scope: str) -> str:
     scope = _normalize_score_scope(scope)
+    if scope == "test_selected":
+        return "HQ-T"
     if scope == "test":
-        return "TEST"
+        return "legacy TEST"
     if scope == "all_fit":
-        return "ALL-FIT"
+        return "HQ-F"
     return str(scope).upper()
 
 
@@ -210,6 +254,8 @@ def _score_scopes_from_arg(value: str) -> List[str]:
     for part in parts:
         norm = _normalize_score_scope(part)
         if norm == "both":
+            out.extend(["test_selected", "all_fit"])
+        elif norm in ("legacy_both", "legacy+both"):
             out.extend(["test", "all_fit"])
         elif norm not in out:
             out.append(norm)
@@ -1096,7 +1142,7 @@ def main() -> None:
     ap.add_argument('--quality_thresholds', nargs='*', type=float, default=DEFAULT_QUALITY_THRESHOLDS)
     ap.add_argument('--min_rule_dataset_coverage', type=float, default=DEFAULT_MIN_RULE_DATASET_COVERAGE,
                     help='Minimum dataset_coverage required before a rule contributes to threshold-sensitivity counts. Use 0 to disable.')
-    ap.add_argument('--score_scope', default='all_fit', help='Score scope(s) for rule-quality/HQ counts: all_fit (default), test, or both. Comma-separated values are allowed.')
+    ap.add_argument('--score_scope', default='all_fit', help='Score scope(s) for rule-quality/HQ counts: all_fit/HQ-F (default for sensitivity figures), test_selected/HQ-T, test/legacy, or both (HQ-T+HQ-F). Comma-separated values are allowed.')
     ap.add_argument('--paper_fig_dir', default=None, help='Optional paper figure directory. If set, cha_budget_vs_tau.pdf is copied under scope-specific subdirs when multiple scopes are requested.')
     args = ap.parse_args()
 

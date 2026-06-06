@@ -1,4 +1,6 @@
 import argparse
+import json
+import hashlib
 import re
 import shutil
 import tempfile
@@ -11,6 +13,40 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+RULE_METRICS_SUMMARY_CACHE_SIGNATURE = "rule_combo_metrics_from_raw_v1"
+
+
+def _rule_metrics_manifest_current(stats_dir: Path) -> bool:
+    """Return True when scoped metric summaries carry the current schema marker.
+
+    The manifest is a semantic/schema certificate for derived
+    rule_combo_metrics_* summaries, not a hard cache key for the whole raw
+    rules_dir.  We intentionally do not reject summaries when the optional raw
+    digest differs: local rules_dir trees can contain extra raw rule_combo files
+    from other runs or later experiments that do not affect this stats folder.
+    Stage 7 still writes the raw digest for audit/debugging, and rerunning
+    Stage 7 with --summarize_rule_metrics overwrites the metric summaries.
+    """
+    manifest_path = Path(stats_dir) / "rule_combo_metrics_manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return manifest.get("signature") == RULE_METRICS_SUMMARY_CACHE_SIGNATURE
+
+
+def _scoped_rule_metrics_are_safe(run_dir: Path, scope: str) -> bool:
+    scope = _normalize_score_scope(scope)
+    if scope not in ("test_selected", "all_fit"):
+        return True
+    ok = _rule_metrics_manifest_current(run_dir)
+    if not ok:
+        print(f"[rule-metrics] warning: stale or missing rule_combo_metrics_manifest.json in {run_dir}; rerun Stage 7 with --summarize_rule_metrics. Ignoring {scope} summaries.")
+    return ok
+
 
 
 def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
@@ -50,29 +86,95 @@ def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
         out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
     return out
 
-def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
-    """Load eval-scored rows and keep one best row per localized neuron."""
-    all_path = run_dir / "rule_combo_metrics_all.csv"
-    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
-    if all_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
-        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
-        if df.empty:
-            return df
-        sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
-        for c in sort_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        if sort_cols:
-            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-        key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
-        if not key_cols:
-            key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
-        if key_cols:
-            df = df.drop_duplicates(key_cols, keep="first")
+def _normalize_score_scope(scope: str) -> str:
+    s = str(scope or "test_selected").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "hqt": "test_selected",
+        "hq_t": "test_selected",
+        "testselected": "test_selected",
+        "heldout_selected": "test_selected",
+        "held_out_selected": "test_selected",
+        "hqf": "all_fit",
+        "hq_f": "all_fit",
+        "allfit": "all_fit",
+        "all": "all_fit",
+        "legacy": "test",
+        "legacy_test": "test",
+    }
+    return aliases.get(s, s)
+
+def _score_scope_slug(scope: str) -> str:
+    return _normalize_score_scope(scope).replace("+", "_")
+
+def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str) -> pd.DataFrame:
+    if df is None or df.empty:
         return df
-    if best_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
+    scope = _normalize_score_scope(score_scope)
+    out = df.copy()
+    scope_col = "score_scope" if "score_scope" in out.columns else "computed_on" if "computed_on" in out.columns else None
+    if scope_col is not None:
+        out = out[out[scope_col].map(_normalize_score_scope) == scope].copy()
+    elif scope != "test":
+        return out.iloc[0:0].copy()
+    return _drop_train_scored_rule_rows(out)
+
+def _best_per_neuron(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in out.columns]
+    for c in sort_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in out.columns]
+    if not key_cols:
+        key_cols = [c for c in ["layer_key", "neuron_id"] if c in out.columns]
+    if key_cols:
+        out = out.drop_duplicates(key_cols, keep="first")
+    return out
+
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scope: str = "test_selected") -> pd.DataFrame:
+    """Load scope-specific rule rows and keep one best row per localized neuron.
+
+    Default is ``test_selected`` (HQ-T): TRAIN-emitted rules whose OR-subset is
+    selected/scored on TEST. Legacy ``test`` rows are loaded only when requested.
+    """
+    scope = _normalize_score_scope(score_scope)
+    if not _scoped_rule_metrics_are_safe(run_dir, scope):
+        return pd.DataFrame()
+    slug = _score_scope_slug(scope)
+    scoped_all = run_dir / f"rule_combo_metrics_{slug}_all.csv"
+    scoped_best = run_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv"
+    all_scopes = run_dir / "rule_combo_metrics_all_scopes.csv"
+
+    if scoped_all.exists():
+        df = pd.read_csv(scoped_all, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        return _best_per_neuron(df)
+    if scoped_best.exists():
+        df = pd.read_csv(scoped_best, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
         return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    if all_scopes.exists():
+        df = pd.read_csv(all_scopes, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        return _best_per_neuron(df)
+
+    # Backward-compatible fallback: old unsuffixed metric files mean legacy TEST,
+    # not HQ-T/test_selected. Do not silently use them for test_selected.
+    if scope == "test":
+        all_path = run_dir / "rule_combo_metrics_all.csv"
+        best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
+        if all_path.exists():
+            df = _filter_rule_rows_by_score_scope(pd.read_csv(all_path, low_memory=False), "test")
+            df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+            return _best_per_neuron(df)
+        if best_path.exists():
+            df = _filter_rule_rows_by_score_scope(pd.read_csv(best_path, low_memory=False), "test")
+            return _apply_min_dataset_coverage(df, min_dataset_coverage)
     return pd.DataFrame()
 
 
@@ -213,7 +315,7 @@ def looks_like_stats_dir(p: Path) -> bool:
     for c in p.iterdir():
         if not c.is_dir() or c.name.startswith(".") or c.name == "__MACOSX":
             continue
-        if (c / "scores.csv").exists() or (c / "rule_combo_metrics_best_per_neuron.csv").exists():
+        if (c / "scores.csv").exists() or (c / "rule_combo_metrics_test_selected_best_per_neuron.csv").exists() or (c / "rule_combo_metrics_best_per_neuron.csv").exists():
             return True
     return False
 
@@ -282,14 +384,14 @@ def union_flip_stats(scores_df: pd.DataFrame, cols: list[str]) -> dict:
 
 # ------------------------- rule-metric collection -------------------------
 
-def collect_rule_metrics_best(runs: list[Path], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
+def collect_rule_metrics_best(runs: list[Path], min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scope: str = "test_selected") -> pd.DataFrame:
     blocks = []
     for run_dir in runs:
         run_name = run_dir.name
         if run_name not in NAME_MAP:
             continue
         run_label = NAME_MAP[run_name]
-        df = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage)
+        df = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope)
         if df.empty:
             continue
         df["stats_dirname"] = run_name
@@ -716,7 +818,7 @@ def threshold_sweep_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.D
         if not scores_path.exists():
             continue
 
-        df_best = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=args.min_rule_dataset_coverage)
+        df_best = _load_eval_best_rule_rows(run_dir, min_dataset_coverage=args.min_rule_dataset_coverage, score_scope=getattr(args, "score_scope", "test_selected"))
         if df_best.empty:
             continue
         if mcol not in df_best.columns:
@@ -798,7 +900,7 @@ def threshold_sweep_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.D
 def rule_metrics_for_stats_dir(stats_root: Path, out_dir: Path, args) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
     runs = discover_runs(stats_root, run_name_regex=args.run_name_regex)
-    df_rm = collect_rule_metrics_best(runs, min_dataset_coverage=args.min_rule_dataset_coverage)
+    df_rm = collect_rule_metrics_best(runs, min_dataset_coverage=args.min_rule_dataset_coverage, score_scope=getattr(args, "score_scope", "test_selected"))
     df_rm = filter_to_name_map_runs(add_derived_rule_metrics(df_rm))
     if df_rm.empty:
         return df_rm
@@ -926,6 +1028,8 @@ def parse_args():
                     help="Minimum held-out dataset_coverage required before a rule contributes to HQ counts/plots. Use 0 to disable.")
     ap.add_argument("--run_name_regex", type=str, default=None,
                     help="Optional regex to filter which run folders to include.")
+    ap.add_argument("--score_scope", type=str, default="test_selected",
+                    help="Rule-combo score scope for rule metrics/threshold sweeps: test_selected (default, HQ-T), all_fit (HQ-F), or test (legacy frozen train-combo TEST).")
     return ap.parse_args()
 
 def main():

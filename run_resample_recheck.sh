@@ -124,7 +124,7 @@ python3 summarize_intervention_shift.py \
   --candidate_label "${INTERVENTION}" \
   --task_name "${TASK_MODULE}" \
   --model_name "${MODEL_ID}" \
-  --hq_score_scope test
+  --hq_score_scope test_selected
 
 python3 summarize_intervention_shift.py \
   --baseline_dir "${BASELINE_STATS_DIR}" \

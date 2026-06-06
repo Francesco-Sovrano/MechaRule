@@ -83,19 +83,23 @@ INTERVENTION_DESCRIPTIONS = {
 
 def _normalize_hq_score_scope(scope: str) -> str:
     sv = str(scope or "all_fit").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if sv in {"test+selected", "heldout+selected", "held+out+selected", "hqt", "hq+t"}:
+        return "test_selected"
     if sv in {"eval", "heldout", "held+out", "test"}:
         return "test"
-    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata"}:
+    if sv in {"all+fit", "allfit", "final+all+fit", "finalfit", "all", "all+data", "full+data", "fulldata", "hqf", "hq+f"}:
         return "all_fit"
     return sv
 
 
 def _hq_score_scope_label(scope: str) -> str:
     scope = _normalize_hq_score_scope(scope)
+    if scope == "test_selected":
+        return "HQ-T"
     if scope == "test":
-        return "TEST"
+        return "legacy TEST"
     if scope == "all_fit":
-        return "ALL-FIT"
+        return "HQ-F"
     return scope.upper()
 
 
@@ -1479,7 +1483,7 @@ def main() -> None:
     ap.add_argument("--task_name", default=None, help="Task name/module to show in reports/figures")
     ap.add_argument("--model_name", default=None, help="Model name/id to show in reports/figures")
     ap.add_argument("--no_plots", action="store_true", help="Write only CSV/JSON/Markdown, no matplotlib figures")
-    ap.add_argument("--hq_score_scope", default="all_fit", choices=["test", "all_fit"], help="HQ score scope to use in intervention-shift summaries/plots. Default is ALL-FIT for descriptive final-fit; TEST remains available for held-out diagnostics.")
+    ap.add_argument("--hq_score_scope", default="all_fit", choices=["test_selected", "test", "all_fit"], help="HQ score scope to use in intervention-shift summaries/plots. Default is HQ-F/all_fit for descriptive final-fit; use test_selected for HQ-T or test for the legacy frozen-combo TEST score.")
     ap.add_argument(
         "--allow_missing_hq_coverage",
         action="store_true",

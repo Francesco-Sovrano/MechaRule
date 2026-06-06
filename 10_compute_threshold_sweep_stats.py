@@ -17,6 +17,8 @@ Typical use:
 from __future__ import annotations
 
 import argparse
+import json
+import hashlib
 from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -25,6 +27,40 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_MIN_RULE_DATASET_COVERAGE = 0.005
+
+RULE_METRICS_SUMMARY_CACHE_SIGNATURE = "rule_combo_metrics_from_raw_v1"
+
+
+def _rule_metrics_manifest_current(stats_dir: Path) -> bool:
+    """Return True when scoped metric summaries carry the current schema marker.
+
+    The manifest is a semantic/schema certificate for derived
+    rule_combo_metrics_* summaries, not a hard cache key for the whole raw
+    rules_dir.  We intentionally do not reject summaries when the optional raw
+    digest differs: local rules_dir trees can contain extra raw rule_combo files
+    from other runs or later experiments that do not affect this stats folder.
+    Stage 7 still writes the raw digest for audit/debugging, and rerunning
+    Stage 7 with --summarize_rule_metrics overwrites the metric summaries.
+    """
+    manifest_path = Path(stats_dir) / "rule_combo_metrics_manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return manifest.get("signature") == RULE_METRICS_SUMMARY_CACHE_SIGNATURE
+
+
+def _scoped_rule_metrics_are_safe(run_dir: Path, scope: str) -> bool:
+    scope = _normalize_score_scope(scope)
+    if scope not in ("test_selected", "all_fit"):
+        return True
+    ok = _rule_metrics_manifest_current(run_dir)
+    if not ok:
+        print(f"[rule-metrics] warning: stale or missing rule_combo_metrics_manifest.json in {run_dir}; rerun Stage 7 with --summarize_rule_metrics. Ignoring {scope} summaries.")
+    return ok
+
 
 
 def _apply_min_dataset_coverage(df: pd.DataFrame, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
@@ -64,29 +100,95 @@ def _drop_train_scored_rule_rows(df: pd.DataFrame) -> pd.DataFrame:
         out = out[~out["rule_combo_path"].astype(str).str.contains("rule_combo_train_", regex=False)].copy()
     return out
 
-def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE) -> pd.DataFrame:
-    """Load eval-scored rows and keep one best row per localized neuron."""
-    all_path = run_dir / "rule_combo_metrics_all.csv"
-    best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
-    if all_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(all_path) if 'safe_read_csv' in globals() else pd.read_csv(all_path, low_memory=False))
-        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
-        if df.empty:
-            return df
-        sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in df.columns]
-        for c in sort_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        if sort_cols:
-            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-        key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in df.columns]
-        if not key_cols:
-            key_cols = [c for c in ["layer_key", "neuron_id"] if c in df.columns]
-        if key_cols:
-            df = df.drop_duplicates(key_cols, keep="first")
+def _normalize_score_scope(scope: str) -> str:
+    s = str(scope or "test_selected").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "hqt": "test_selected",
+        "hq_t": "test_selected",
+        "testselected": "test_selected",
+        "heldout_selected": "test_selected",
+        "held_out_selected": "test_selected",
+        "hqf": "all_fit",
+        "hq_f": "all_fit",
+        "allfit": "all_fit",
+        "all": "all_fit",
+        "legacy": "test",
+        "legacy_test": "test",
+    }
+    return aliases.get(s, s)
+
+def _score_scope_slug(scope: str) -> str:
+    return _normalize_score_scope(scope).replace("+", "_")
+
+def _filter_rule_rows_by_score_scope(df: pd.DataFrame, score_scope: str) -> pd.DataFrame:
+    if df is None or df.empty:
         return df
-    if best_path.exists():
-        df = _drop_train_scored_rule_rows(safe_read_csv(best_path) if 'safe_read_csv' in globals() else pd.read_csv(best_path, low_memory=False))
+    scope = _normalize_score_scope(score_scope)
+    out = df.copy()
+    scope_col = "score_scope" if "score_scope" in out.columns else "computed_on" if "computed_on" in out.columns else None
+    if scope_col is not None:
+        out = out[out[scope_col].map(_normalize_score_scope) == scope].copy()
+    elif scope != "test":
+        return out.iloc[0:0].copy()
+    return _drop_train_scored_rule_rows(out)
+
+def _best_per_neuron(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    sort_cols = [c for c in ["MCC", "F1", "BalancedAcc"] if c in out.columns]
+    for c in sort_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    key_cols = [c for c in ["rule_target_dir", "neuron_key"] if c in out.columns]
+    if not key_cols:
+        key_cols = [c for c in ["layer_key", "neuron_id"] if c in out.columns]
+    if key_cols:
+        out = out.drop_duplicates(key_cols, keep="first")
+    return out
+
+def _load_eval_best_rule_rows(run_dir: Path, min_dataset_coverage: float = DEFAULT_MIN_RULE_DATASET_COVERAGE, score_scope: str = "test_selected") -> pd.DataFrame:
+    """Load scope-specific rule rows and keep one best row per localized neuron.
+
+    Default is ``test_selected`` (HQ-T): TRAIN-emitted rules whose OR-subset is
+    selected/scored on TEST. Legacy ``test`` rows are loaded only when requested.
+    """
+    scope = _normalize_score_scope(score_scope)
+    if not _scoped_rule_metrics_are_safe(run_dir, scope):
+        return pd.DataFrame()
+    slug = _score_scope_slug(scope)
+    scoped_all = run_dir / f"rule_combo_metrics_{slug}_all.csv"
+    scoped_best = run_dir / f"rule_combo_metrics_{slug}_best_per_neuron.csv"
+    all_scopes = run_dir / "rule_combo_metrics_all_scopes.csv"
+
+    if scoped_all.exists():
+        df = pd.read_csv(scoped_all, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        return _best_per_neuron(df)
+    if scoped_best.exists():
+        df = pd.read_csv(scoped_best, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
         return _apply_min_dataset_coverage(df, min_dataset_coverage)
+    if all_scopes.exists():
+        df = pd.read_csv(all_scopes, low_memory=False)
+        df = _filter_rule_rows_by_score_scope(df, scope)
+        df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+        return _best_per_neuron(df)
+
+    # Backward-compatible fallback: old unsuffixed metric files mean legacy TEST,
+    # not HQ-T/test_selected. Do not silently use them for test_selected.
+    if scope == "test":
+        all_path = run_dir / "rule_combo_metrics_all.csv"
+        best_path = run_dir / "rule_combo_metrics_best_per_neuron.csv"
+        if all_path.exists():
+            df = _filter_rule_rows_by_score_scope(pd.read_csv(all_path, low_memory=False), "test")
+            df = _apply_min_dataset_coverage(df, min_dataset_coverage)
+            return _best_per_neuron(df)
+        if best_path.exists():
+            df = _filter_rule_rows_by_score_scope(pd.read_csv(best_path, low_memory=False), "test")
+            return _apply_min_dataset_coverage(df, min_dataset_coverage)
     return pd.DataFrame()
 
 from scipy import stats
@@ -176,9 +278,11 @@ def _method_col(df: pd.DataFrame) -> str:
 
 def _normalize_score_scope(scope: str) -> str:
     s = str(scope or "test").strip().lower().replace("_", "+").replace("-", "+").replace(" ", "")
+    if s in ("test+selected", "heldout+selected", "held+out+selected", "hqt", "hq+t"):
+        return "test_selected"
     if s in ("eval", "heldout", "held+out", "test"):
         return "test"
-    if s in ("all+fit", "allfit", "final+all+fit", "finalfit", "all"):
+    if s in ("all+fit", "allfit", "final+all+fit", "finalfit", "all", "hqf", "hq+f"):
         return "all_fit"
     if s in ("train+test", "train+eval", "all+data", "traintest"):
         return "all_fit"
@@ -489,7 +593,7 @@ def collect_per_neuron_scores(
             if _load_best_rule_metrics is not None:
                 df = _load_best_rule_metrics(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope)
             else:
-                df = _load_eval_best_rule_rows(stats_dir, min_dataset_coverage=min_dataset_coverage)
+                df = _load_eval_best_rule_rows(stats_dir, min_dataset_coverage=min_dataset_coverage, score_scope=score_scope)
             if df.empty:
                 continue
             if metric_col not in df.columns:
@@ -672,9 +776,9 @@ def main() -> None:
     ap.add_argument("--csv", required=True, help="Path to table2_threshold_sweep_per_run_long.csv")
     ap.add_argument("--metric", default="n_high_quality_neurons")
     ap.add_argument("--thresholds", nargs="*", type=float, default=DEFAULT_THRESHOLDS)
-    ap.add_argument("--primary_threshold", type=float, default=0.70, help="Primary held-out/test MCC threshold. Default: 0.70.")
+    ap.add_argument("--primary_threshold", type=float, default=0.70, help="Primary HQ-T/test-selected MCC threshold. Default: 0.70.")
     ap.add_argument("--primary_threshold_all_fit", type=float, default=0.70, help="Primary all-fit MCC threshold. Default: 0.70.")
-    ap.add_argument("--score-scope", default="both", choices=["test", "all_fit", "both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' writes/prints held-out TEST and ALL-FIT results separately.")
+    ap.add_argument("--score-scope", default="both", choices=["test", "test_selected", "all_fit", "both", "legacy_both"], help="Score scope(s) to analyze when the input CSV contains multiple scopes. Default 'both' means paper defaults: HQ-T/test_selected plus HQ-F/all_fit. Use 'test' for the legacy frozen-combo TEST score or 'legacy_both' for legacy TEST plus ALL-FIT.")
     ap.add_argument("--alt", choices=["two-sided", "greater", "less"], default="greater", help="Alternative for A-B.")
     ap.add_argument("--out_dir", default=None, help="Optional output directory for CSV artifacts.")
     ap.add_argument("--seed", type=int, default=0)
@@ -691,7 +795,13 @@ def main() -> None:
     args = ap.parse_args()
 
     base_out_dir = Path(args.out_dir) if args.out_dir else None
-    score_scopes = ["test", "all_fit"] if str(args.score_scope).strip().lower() == "both" else [_normalize_score_scope(args.score_scope)]
+    scope_arg = str(args.score_scope).strip().lower()
+    if scope_arg == "both":
+        score_scopes = ["test_selected", "all_fit"]
+    elif scope_arg == "legacy_both":
+        score_scopes = ["test", "all_fit"]
+    else:
+        score_scopes = [_normalize_score_scope(args.score_scope)]
     thresholds = [round(float(t), 6) for t in args.thresholds]
     wrote_dirs = []
 
