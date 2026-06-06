@@ -19,6 +19,48 @@ This repository uses RuleSHAP-style rule extraction in `lib/ruleshap.py` and `li
 
 - RuleSHAP: https://github.com/Francesco-Sovrano/RuleSHAP
 
+## Reproducibility artifacts
+
+Large generated artifacts are not stored in this repository. The `data/` and `cache/` directories used to reproduce the paper results are archived on Zenodo:
+
+- Zenodo DOI: `10.5281/zenodo.20533529`
+- DOI landing page: https://doi.org/10.5281/zenodo.20533529
+- Files: `data.zip` and `cache.zip`
+
+To reproduce from the archived artifacts, clone this repository, download both ZIP files from Zenodo, and unzip them into the repository root, i.e., the directory containing this `README.md`, `requirements.txt`, and the run scripts. The two compressed archives are large, so keep enough free disk space for both the ZIP files and the extracted `data/` and `cache/` directories.
+
+```bash
+git clone https://github.com/Francesco-Sovrano/MechaRule.git
+cd MechaRule
+
+# Download from the Zenodo record associated with DOI 10.5281/zenodo.20533529.
+# Placeholder direct-download URLs: replace these two values with the final Zenodo file links.
+DATA_ZIP_URL="<DATA_ZIP_DOWNLOAD_URL>"
+CACHE_ZIP_URL="<CACHE_ZIP_DOWNLOAD_URL>"
+
+curl -L "$DATA_ZIP_URL" -o data.zip
+curl -L "$CACHE_ZIP_URL" -o cache.zip
+
+unzip data.zip -d .
+unzip cache.zip -d .
+
+# Optional sanity check.
+python check_artifacts.py
+```
+
+After extraction, the repository root should contain at least:
+
+```text
+MechaRule/
+  data/
+  cache/
+  README.md
+  requirements.txt
+  run_paper_tables_generation.sh
+```
+
+The archived `data/` and `cache/` directories are intended for reproducing the reported analyses without rerunning every expensive generation, circuit-discovery, and ablation step from scratch. Fully regenerating the experiments may require GPU resources, local or hosted model access, and the API credentials described below. See `ARTIFACTS.md` for a compact reviewer-oriented reproduction checklist.
+
 ## What the pipeline does
 
 MechaRule has four main stages:
@@ -59,6 +101,9 @@ The pipeline is designed for auditing learned behaviours in open-weight LLMs. So
 | `run_paper_tables_generation.sh` | Generates paper-oriented summary tables. |
 | `make_paper_tables.py` | Builds paper summary tables from completed experiment outputs, reporting both held-out TEST HQ counts and descriptive ALL-FIT HQ counts by default. |
 | `clean_results_for_export.py` | Removes or normalizes bulky generated artifacts before exporting results. |
+| `check_artifacts.py` | Verifies that Zenodo `data/` and `cache/` artifacts were extracted into the repository root. |
+| `ARTIFACTS.md` | Compact reviewer-oriented checklist for downloading and using the Zenodo artifacts. |
+| `credentials.env.example` | Example environment-variable file for optional hosted API credentials. |
 
 ### Core library modules
 
@@ -163,6 +208,19 @@ ollama pull gemma3:27b
 ```
 
 ## Quickstart
+
+### Reproduce paper tables from Zenodo artifacts
+
+If you downloaded and unzipped `data.zip` and `cache.zip` from Zenodo DOI `10.5281/zenodo.20533529` into the repository root, verify the expected layout and generate the paper-oriented tables with:
+
+```bash
+python check_artifacts.py
+bash setup.sh
+. .env/bin/activate
+bash run_paper_tables_generation.sh
+```
+
+This path uses the archived outputs and caches. To rerun the full experiment grid from scratch, use the commands below instead.
 
 ### Run the main experiment grid
 
@@ -431,7 +489,9 @@ find . -maxdepth 1 -name '*.sh' -print0 | xargs -0 -I{} bash -n '{}'
 
 ## Citation
 
-If you use this repository, please cite:
+If you use this repository, please cite the paper and the Zenodo artifact record. A machine-readable citation file is provided in `CITATION.cff`.
+
+The accompanying reproducibility artifacts (`data.zip` and `cache.zip`) are archived on Zenodo under DOI `10.5281/zenodo.20533529`.
 
 ```bibtex
 @inproceedings{sovrano2026neuronanchored,
